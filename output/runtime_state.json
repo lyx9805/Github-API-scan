@@ -1,0 +1,155 @@
+{
+  "updated_at": "2026-06-23T12:52:45.712456",
+  "stats": {
+    "total_scanned": 1497,
+    "total_keys_found": 417,
+    "valid_keys": 0,
+    "invalid_keys": 228,
+    "quota_exceeded": 0,
+    "connection_errors": 0,
+    "queue_size": 0,
+    "skipped_low_entropy": 59,
+    "skipped_blacklist": 10,
+    "skipped_sha": 998012,
+    "skipped_file_filter": 371,
+    "skipped_existing": 0,
+    "current_keyword": "filename:.env OPENAI_BASE_URL NOT staging NOT sandbox NOT example",
+    "current_token_index": 1,
+    "total_tokens": 2,
+    "is_running": true,
+    "scan_run_id": "20260623-124823-r1",
+    "round_number": 1,
+    "round_keyword_index": 16,
+    "round_total_keywords": 48,
+    "round_scanned": 0,
+    "round_keys_found": 0,
+    "round_valid_keys": 0,
+    "round_started_at": "2026-06-23T12:48:23.624931",
+    "keys_by_source": {},
+    "query_quality": {
+      "filename:.env OPENAI_API_KEY NOT staging NOT sandbox NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:48:24.587985"
+      },
+      "filename:.env OPENAI_API_KEY NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:49:24.586597"
+      },
+      "filename:.env.local OPENAI_API_KEY NOT staging NOT sandbox NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:49:40.420188"
+      },
+      "filename:.env.local OPENAI_API_KEY NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:49:42.922729"
+      },
+      "filename:.env.production OPENAI_API_KEY NOT staging NOT sandbox NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:49:47.418891"
+      },
+      "filename:.env.production OPENAI_API_KEY NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:50:25.835073"
+      },
+      "filename:config.json openai_api_key NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:50:48.859740"
+      },
+      "filename:secrets.json openai_api_key NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:50:50.607612"
+      },
+      "filename:secrets.yaml openai_api_key NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:50:55.948560"
+      },
+      "filename:config.json openai_api_key NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:51:27.029195"
+      },
+      "filename:secrets.json openai_api_key NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:51:29.350369"
+      },
+      "filename:secrets.yaml openai_api_key NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:51:57.441272"
+      },
+      "filename:config.json sk-proj- NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:52:00.371576"
+      },
+      "filename:secrets.json sk-proj- NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:52:34.553424"
+      },
+      "filename:secrets.yaml sk-proj- NOT test NOT example": {
+        "scanned": 1,
+        "found": 0,
+        "valid": 0,
+        "score": 0.0,
+        "last_seen": "2026-06-23T12:52:35.683215"
+      }
+    }
+  },
+  "recent_logs": [
+    "[dim]12:52:09[/] [cyan][SCAN][/] [Sourcegraph] 搜索: filename:config.py endpoint NOT test",
+    "[dim]12:52:16[/] [cyan][SCAN][/] [Gist] 获取公开 Gist...",
+    "[dim]12:52:17[/] [dim][DEBUG][/] [Sourcegraph]   无结果",
+    "[dim]12:52:20[/] [cyan][SCAN][/] [Sourcegraph] 搜索: OPENAI_API_KEY= one-api NOT test NOT demo NOT example",
+    "[dim]12:52:24[/] [white][INFO][/] [Gist] 找到 20 个 Gist 文件",
+    "[dim]12:52:24[/] [white][INFO][/] [Gist] 等待 3 分钟后开始下一轮...",
+    "[dim]12:52:30[/] [dim][DEBUG][/] [Sourcegraph]   无结果",
+    "[dim]12:52:33[/] [cyan][SCAN][/] [Sourcegraph] 搜索: OPENAI_API_KEY= one-api NOT test NOT example NOT staging",
+    "[dim]12:52:35[/] [cyan][SCAN][/] 搜索 \"filename:secrets.yaml sk-proj- NOT test NOT example\"...",
+    "[dim]12:52:40[/] [cyan][SCAN][/] 搜索 \"filename:.env OPENAI_BASE_URL NOT staging NOT sandbox NOT example\"...",
+    "[dim]12:52:41[/] [yellow][WARN][/] Code Search 配额耗尽，进入等待/切换 Token",
+    "[dim]12:52:41[/] [yellow][WARN][/] 请求退避 15s (rate_limit)",
+    "[dim]12:52:41[/] [yellow][WARN][/] 所有 Token 的 Code Search 配额暂时不可用，约 22s 后恢复",
+    "[dim]12:52:41[/] [yellow][WARN][/] 全部 Token Code Search 配额耗尽，等待 22s...",
+    "[dim]12:52:42[/] [dim][DEBUG][/] [Sourcegraph]   无结果"
+  ],
+  "valid_keys": []
+}

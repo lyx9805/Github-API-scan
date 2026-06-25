@@ -9,8 +9,11 @@ UI 模块 - Rich TUI 仪表盘
 - Footer: 进度条
 """
 
+import json
+import os
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Deque
 from collections import deque
 from dataclasses import dataclass, field
@@ -44,10 +47,23 @@ class DashboardStats:
     queue_size: int = 0             # 队列大小
     skipped_low_entropy: int = 0    # 低熵值跳过数
     skipped_blacklist: int = 0      # 黑名单跳过数
+    skipped_sha: int = 0            # 历史已扫文件跳过数
+    skipped_file_filter: int = 0    # 文件过滤跳过数
+    skipped_existing: int = 0       # 已入库/重复候选跳过数
     current_keyword: str = ""       # 当前搜索关键词
     current_token_index: int = 0    # 当前 Token 索引
     total_tokens: int = 0           # Token 总数
     is_running: bool = True         # 是否运行中
+    scan_run_id: str = ""           # 当前扫描轮次 ID
+    round_number: int = 0           # 当前轮次序号
+    round_keyword_index: int = 0    # 当前关键词序号（1-based）
+    round_total_keywords: int = 0   # 本轮关键词总数
+    round_scanned: int = 0          # 本轮新扫文件数
+    round_keys_found: int = 0       # 本轮发现 Key 数
+    round_valid_keys: int = 0       # 本轮有效 Key 数
+    round_started_at: str = ""      # 本轮开始时间
+    query_quality: dict = field(default_factory=dict)  # 查询质量回灌数据
+    keys_by_source: dict = field(default_factory=dict)  # 按来源统计发现的 Key 数
 
 
 @dataclass
@@ -111,9 +127,56 @@ class Dashboard:
         self.stats = DashboardStats()
         self.valid_keys: List[ValidKeyRecord] = []
         self.logs: Deque[str] = deque(maxlen=15)  # 保留最新 15 条日志
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._live: Live = None
+        self.state_file = Path(os.getenv("RUNTIME_STATE_PATH", "/app/output/runtime_state.json"))
+        self.cumulative_file = Path(os.getenv("CUMULATIVE_STATS_PATH", "/app/output/cumulative_stats.json"))
+        self._load_cumulative_stats()
         
+    def _load_cumulative_stats(self):
+        """从共享文件加载累计统计，避免重启后清零。"""
+        if not self.cumulative_file.exists():
+            return
+        try:
+            data = json.loads(self.cumulative_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for key in [
+            "total_scanned",
+            "total_keys_found",
+            "valid_keys",
+            "invalid_keys",
+            "quota_exceeded",
+            "connection_errors",
+            "skipped_low_entropy",
+            "skipped_blacklist",
+            "skipped_sha",
+            "skipped_file_filter",
+            "skipped_existing",
+        ]:
+            value = data.get(key)
+            if isinstance(value, int) and hasattr(self.stats, key):
+                setattr(self.stats, key, value)
+
+    def _write_cumulative_stats(self):
+        """保存累计统计；轮次、队列、当前搜索不持久化。"""
+        payload = {
+            "updated_at": datetime.now().isoformat(),
+            "total_scanned": self.stats.total_scanned,
+            "total_keys_found": self.stats.total_keys_found,
+            "valid_keys": self.stats.valid_keys,
+            "invalid_keys": self.stats.invalid_keys,
+            "quota_exceeded": self.stats.quota_exceeded,
+            "connection_errors": self.stats.connection_errors,
+            "skipped_low_entropy": self.stats.skipped_low_entropy,
+            "skipped_blacklist": self.stats.skipped_blacklist,
+            "skipped_sha": self.stats.skipped_sha,
+            "skipped_file_filter": self.stats.skipped_file_filter,
+            "skipped_existing": self.stats.skipped_existing,
+        }
+        self.cumulative_file.parent.mkdir(parents=True, exist_ok=True)
+        self.cumulative_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _create_layout(self) -> Layout:
         """创建布局"""
         layout = Layout()
@@ -336,7 +399,7 @@ class Dashboard:
     def add_log(self, message: str, level: str = "INFO"):
         """添加日志条目"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        
+
         # 根据级别设置颜色
         level_colors = {
             "INFO": "white",
@@ -350,11 +413,12 @@ class Dashboard:
             "DEBUG": "dim",
         }
         color = level_colors.get(level, "white")
-        
+
         formatted = f"[dim]{timestamp}[/] [{color}][{level}][/] {message}"
-        
+
         with self._lock:
             self.logs.append(formatted)
+        self.export_runtime_state()
     
     def add_valid_key(
         self, 
@@ -386,25 +450,35 @@ class Dashboard:
         with self._lock:
             self.valid_keys.append(record)
             self.stats.valid_keys += 1
-            
+            self.stats.round_valid_keys += 1
+
+            if self.stats.current_keyword:
+                self._record_query_quality(self.stats.current_keyword, valid=1)
+
             # 高价值 Key 特殊日志
             if is_high_value:
                 self.logs.append(
                     f"[dim]{datetime.now().strftime('%H:%M:%S')}[/] [bold gold1][💎 HIGH][/] "
                     f"发现高价值 Key: {platform.upper()} {masked_key}"
                 )
+        self.export_runtime_state()
     
     def update_stats(self, **kwargs):
         """更新统计数据"""
         with self._lock:
             for key, value in kwargs.items():
                 if hasattr(self.stats, key):
-                    if isinstance(value, int) and key not in ['current_token_index', 'total_tokens', 'queue_size']:
+                    if isinstance(value, int) and not isinstance(value, bool) and key not in [
+                        'current_token_index', 'total_tokens', 'queue_size',
+                        'round_number', 'round_keyword_index', 'round_total_keywords',
+                        'round_scanned', 'round_keys_found', 'round_valid_keys'
+                    ]:
                         # 累加
                         setattr(self.stats, key, getattr(self.stats, key) + value)
                     else:
                         # 直接设置
                         setattr(self.stats, key, value)
+        self.export_runtime_state()
     
     def increment_stat(self, stat_name: str, amount: int = 1):
         """增加统计值"""
@@ -412,7 +486,108 @@ class Dashboard:
             if hasattr(self.stats, stat_name):
                 current = getattr(self.stats, stat_name)
                 setattr(self.stats, stat_name, current + amount)
-    
+            if stat_name == "total_scanned":
+                self.stats.round_scanned += amount
+            elif stat_name == "total_keys_found":
+                self.stats.round_keys_found += amount
+        self.export_runtime_state()
+
+    def increment_source_found(self, source: str, amount: int = 1):
+        """按来源增加发现 Key 计数"""
+        with self._lock:
+            if not hasattr(self.stats, 'keys_by_source') or self.stats.keys_by_source is None:
+                self.stats.keys_by_source = {}
+            self.stats.keys_by_source[source] = self.stats.keys_by_source.get(source, 0) + amount
+        self.export_runtime_state()
+
+    def start_scan_run(self, scan_run_id: str, round_number: int, total_keywords: int):
+        """开始新的扫描轮次，并重置本轮计数。"""
+        with self._lock:
+            self.stats.scan_run_id = scan_run_id
+            self.stats.round_number = round_number
+            self.stats.round_keyword_index = 0
+            self.stats.round_total_keywords = total_keywords
+            self.stats.round_scanned = 0
+            self.stats.round_keys_found = 0
+            self.stats.round_valid_keys = 0
+            self.stats.round_started_at = datetime.now().isoformat()
+            self.logs.clear()
+            self.logs.append(f"[dim]{datetime.now().strftime('%H:%M:%S')}[/] [cyan][SCAN][/] 新扫描轮次开始：{scan_run_id}")
+        self.export_runtime_state()
+
+    def _record_query_quality(self, keyword: str, scanned: int = 0, found: int = 0, valid: int = 0):
+        """按关键词累计简单质量指标，用于后续回灌。"""
+        if not keyword:
+            return
+        bucket = self.stats.query_quality.setdefault(keyword, {
+            "scanned": 0,
+            "found": 0,
+            "valid": 0,
+            "score": 0.0,
+            "last_seen": "",
+        })
+        bucket["scanned"] += int(scanned)
+        bucket["found"] += int(found)
+        bucket["valid"] += int(valid)
+        if bucket["scanned"] > 0:
+            bucket["score"] = round((bucket["valid"] * 3 + bucket["found"]) / bucket["scanned"], 4)
+        bucket["last_seen"] = datetime.now().isoformat()
+        if len(self.stats.query_quality) > 256:
+            keep = dict(sorted(self.stats.query_quality.items(), key=lambda item: (item[1].get("score", 0), item[1].get("valid", 0), item[1].get("found", 0)), reverse=True)[:256])
+            self.stats.query_quality = keep
+        self.export_runtime_state()
+
+    def export_runtime_state(self):
+        """导出运行时状态到共享 JSON 文件"""
+        with self._lock:
+            payload = {
+                "updated_at": datetime.now().isoformat(),
+                "stats": {
+                    "total_scanned": self.stats.total_scanned,
+                    "total_keys_found": self.stats.total_keys_found,
+                    "valid_keys": self.stats.valid_keys,
+                    "invalid_keys": self.stats.invalid_keys,
+                    "quota_exceeded": self.stats.quota_exceeded,
+                    "connection_errors": self.stats.connection_errors,
+                    "queue_size": self.stats.queue_size,
+                    "skipped_low_entropy": self.stats.skipped_low_entropy,
+                    "skipped_blacklist": self.stats.skipped_blacklist,
+                    "skipped_sha": self.stats.skipped_sha,
+                    "skipped_file_filter": self.stats.skipped_file_filter,
+                    "skipped_existing": self.stats.skipped_existing,
+                    "current_keyword": self.stats.current_keyword,
+                    "current_token_index": self.stats.current_token_index,
+                    "total_tokens": self.stats.total_tokens,
+                    "is_running": self.stats.is_running,
+                    "scan_run_id": self.stats.scan_run_id,
+                    "round_number": self.stats.round_number,
+                    "round_keyword_index": self.stats.round_keyword_index,
+                    "round_total_keywords": self.stats.round_total_keywords,
+                    "round_scanned": self.stats.round_scanned,
+                    "round_keys_found": self.stats.round_keys_found,
+                    "round_valid_keys": self.stats.round_valid_keys,
+                    "round_started_at": self.stats.round_started_at,
+                    "keys_by_source": dict(self.stats.keys_by_source) if self.stats.keys_by_source else {},
+                    "query_quality": dict(self.stats.query_quality) if self.stats.query_quality else {},
+                },
+                "recent_logs": list(self.logs),
+                "valid_keys": [
+                    {
+                        "platform": record.platform,
+                        "masked_key": record.masked_key,
+                        "balance": record.balance,
+                        "source": record.source,
+                        "found_time": record.found_time,
+                        "is_high_value": record.is_high_value,
+                    }
+                    for record in self.valid_keys[-10:]
+                ],
+            }
+
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._write_cumulative_stats()
+
     def start(self) -> Live:
         """启动实时刷新"""
         self._live = Live(

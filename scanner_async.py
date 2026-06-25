@@ -43,7 +43,8 @@ async def async_scanner_worker(
 
     try:
         # 使用 GitHub API 扫描
-        for keyword in config.search_keywords:
+        ordered_keywords = config.get_scheduled_search_keywords()
+        for keyword in ordered_keywords:
             if stop_event.is_set():
                 break
 

@@ -1498,6 +1498,78 @@ def start_validators(
 
 
 # ============================================================================
+#                          异步验证适配函数
+# ============================================================================
+
+async def validate_key_async(
+    platform: str,
+    api_key: str,
+    base_url: str,
+    circuit_breaker: CircuitBreaker = None
+) -> tuple:
+    """
+    异步验证单个 Key（供 validator_async.py 使用）
+
+    Args:
+        platform: 平台名称
+        api_key: API Key
+        base_url: 基础 URL
+        circuit_breaker: 断路器实例（可选）
+
+    Returns:
+        tuple: (status, balance_info, model_tier, rpm, is_high_value)
+    """
+    from database import Database
+
+    # 创建临时验证器（不需要真实的数据库）
+    class _TempDB:
+        def key_exists(self, key): return False
+        def insert_key(self, key): return True
+        def update_key_status(self, *args, **kwargs): pass
+
+    validator = AsyncValidator(_TempDB())
+
+    # 构建 ScanResult 对象
+    ScanResult = get_scan_result_class()
+    result = ScanResult(
+        platform=platform,
+        api_key=api_key,
+        base_url=base_url,
+        source_url=""
+    )
+
+    # 执行验证
+    vr = await validator.validate_single(result)
+
+    # 深度探测（仅对有效的 OpenAI/Relay Key）
+    if vr.status == KeyStatus.VALID and platform.lower() in ['openai', 'relay']:
+        try:
+            has_gpt4 = await validator.probe_gpt4(api_key, base_url)
+            billing_result = await validator.probe_billing(api_key, base_url)
+
+            if has_gpt4:
+                vr.model_tier = "GPT-4"
+                vr.is_high_value = True
+
+            if billing_result.get('balance', 0) > 0:
+                vr.balance_usd = billing_result['balance']
+                vr.is_high_value = True
+        except Exception:
+            pass
+
+    # 构建余额信息字符串
+    balance_str = vr.info
+    if vr.balance_usd > 0:
+        balance_str = f"${vr.balance_usd:.2f} | {vr.info}"
+    if vr.model_tier:
+        balance_str = f"{vr.model_tier} | {balance_str}"
+
+    await validator.close()
+
+    return (vr.status, balance_str, vr.model_tier, vr.rpm, vr.is_high_value)
+
+
+# ============================================================================
 #                          v2.1 优化版导出
 # ============================================================================
 

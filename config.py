@@ -1,4 +1,4 @@
-"""
+﻿"""
 配置模块 - 集中管理所有配置项
 
 本模块提供：
@@ -10,8 +10,17 @@
 
 import os
 import random
+from functools import lru_cache
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, FrozenSet
+from typing import Any, Dict, List, Optional, Set, FrozenSet, TypedDict
+
+
+class QueryTemplateSpec(TypedDict, total=False):
+    template: str
+    structural: List[str]
+    core: List[str]
+    context: List[str]
+    negative: List[str]
 
 
 # ============================================================================
@@ -158,6 +167,89 @@ BASE_URL_PATTERNS = [
 URL_PRIORITY_KEYWORDS = ['base', 'api', 'host', 'endpoint', 'proxy', 'openai', 'relay']
 
 
+@lru_cache(maxsize=512)
+def score_search_keyword(keyword: str) -> tuple[int, str, tuple[str, ...]]:
+    """Score a GitHub search keyword so higher-value tasks run first."""
+    normalized = " ".join(keyword.lower().split())
+    score = 0
+    reasons: List[str] = []
+
+    def bump(points: int, reason: str):
+        nonlocal score
+        score += points
+        reasons.append(reason)
+
+    # Strong, high-signal targets first.
+    if any(marker in normalized for marker in (
+        'filename:.env',
+        'filename:.env.local',
+        'filename:.env.production',
+        'filename:.env.prod',
+        'filename:secrets',
+        'filename:config',
+    )):
+        bump(30, 'secret-file')
+
+    if any(marker in normalized for marker in (
+        'openai_api_key',
+        'anthropic_api_key',
+        'gemini_api_key',
+        'sk-proj-',
+        'sk-ant-',
+        'hf_',
+        'gsk_',
+        'ghp_',
+        'glpat-',
+    )):
+        bump(28, 'strong-secret')
+
+    if any(marker in normalized for marker in (
+        'base_url',
+        'openai_base_url',
+        'endpoint',
+        'relay',
+        'one-api',
+        'new-api',
+    )):
+        bump(16, 'relay-context')
+
+    if 'filename:' in normalized:
+        bump(14, 'filename-scope')
+
+    if 'language:' in normalized:
+        bump(5, 'language-scope')
+
+    if any(marker in normalized for marker in ('repo:', 'org:', 'user:')):
+        bump(10, 'repo-scope')
+
+    if any(marker in normalized for marker in ('not test', 'not example', 'not demo', 'not mock', 'not staging')):
+        bump(6, 'noise-filter')
+
+    # Broader, less precise queries are still useful but should run later.
+    if 'sk-' in normalized and 'filename:' not in normalized:
+        bump(12, 'key-signal')
+
+    if any(marker in normalized for marker in ('openai', 'anthropic', 'gemini', 'azure', 'relay', 'one-api', 'new-api')):
+        bump(8, 'platform-signal')
+
+    if normalized.count('not ') >= 2:
+        bump(4, 'multi-exclusion')
+
+    if len(normalized.split()) <= 2:
+        bump(3, 'short-query')
+
+    if score >= 60:
+        bucket = 'p0'
+    elif score >= 35:
+        bucket = 'p1'
+    elif score >= 18:
+        bucket = 'p2'
+    else:
+        bucket = 'p3'
+
+    return score, bucket, tuple(reasons)
+
+
 # ============================================================================
 #                              配置类
 # ============================================================================
@@ -178,6 +270,12 @@ class Config:
     proxy_url: str = field(
         default_factory=lambda: os.getenv("PROXY_URL", "")  # 直连模式
     )
+    proxy_urls: List[str] = field(default_factory=lambda: [
+        item.strip() for item in os.getenv("PROXY_POOL_URLS", "").split(",") if item.strip()
+    ])
+    proxy_urls: List[str] = field(default_factory=lambda: [
+        item.strip() for item in os.getenv("PROXY_POOL_URLS", "").split(",") if item.strip()
+    ])
     
     # ==================== GitHub Token 池 ====================
     # 多 Token 轮询可有效规避速率限制
@@ -216,6 +314,23 @@ class Config:
     
     # ==================== 网络配置 ====================
     request_timeout: int = 15  # HTTP 请求超时（秒）
+
+    # ==================== Redis 配置 ====================
+    # Redis 持久化缓存地址（可选）
+    # 设置后 L1/L2/L3 缓存自动持久化到 Redis，跨启动生效
+    # 格式: redis://localhost:6379/0
+    redis_url: str = field(
+        default_factory=lambda: os.getenv('REDIS_URL', '')
+    )
+
+    # ==================== Provider 白名单 ====================
+    # 默认只启用用户当前关注的 OpenAI / 中转站兼容目标。
+    # 其他 provider 的正则、关键词和扫描源不会参与本轮扫描，避免额外消耗 GitHub Code Search 配额。
+    enabled_providers: List[str] = field(default_factory=lambda: [
+        item.strip().lower()
+        for item in os.getenv("ENABLED_PROVIDERS", "openai,relay,oneapi,newapi").split(",")
+        if item.strip()
+    ])
     
     # ==================== 熍断器配置 ====================
     circuit_breaker_enabled: bool = True  # 是否启用熍断器
@@ -223,147 +338,86 @@ class Config:
     # ==================== 扫描配置 ====================
     context_window: int = 10  # 上下文窗口（前后各 N 行）
     
-    # 搜索关键词 - 高精度狙击模式 (Sniper Dorks) v2.0
-    # 策略: 精准文件名 + 排除测试/示例 + 多平台覆盖
-    search_keywords: List[str] = field(default_factory=lambda: [
-        # ============================================================================
-        #                          1. OpenAI 高价值目标
-        # ============================================================================
-        'filename:.env OPENAI_API_KEY NOT staging NOT sandbox NOT example',
-        'filename:.env.local OPENAI_API_KEY NOT test',
-        'filename:.env.production OPENAI_API_KEY',
-        'filename:.env.prod OPENAI_API_KEY',
-        'filename:secrets.yaml openai_api_key NOT example',
-        'filename:secrets.json OPENAI_API_KEY NOT test',
-        'filename:config.json sk-proj- NOT example NOT test',
-        'sk-proj- language:python NOT test NOT example NOT mock NOT staging',
-        'sk-proj- language:javascript NOT test NOT example NOT mock',
-        '"Authorization: Bearer sk-" NOT test NOT example',
-        'OPENAI_API_KEY= sk- NOT test NOT example NOT staging',
+    # 搜索词槽与模板 - 用于受控生成布尔查询图
+    query_vocab: Dict[str, List[str]] = field(default_factory=lambda: {
+        "core_signals": [
+            "OPENAI_API_KEY",
+            "sk-proj-",
+            "sk-",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_BASE_URL",
+        ],
+        "context_signals": [
+            "base_url",
+            "endpoint",
+            "proxy",
+            "relay",
+            "one-api",
+            "new-api",
+        ],
+        "structural_signals": [
+            "filename:.env",
+            "filename:.env.local",
+            "filename:.env.production",
+            "filename:secrets.yaml",
+            "filename:secrets.json",
+            "filename:config.json",
+            "filename:config.py",
+            "language:python",
+            "language:javascript",
+        ],
+        "negative_terms": [
+            "NOT test",
+            "NOT example",
+            "NOT demo",
+            "NOT mock",
+            "NOT staging",
+            "NOT sandbox",
+        ],
+    })
 
-        # ============================================================================
-        #                          2. Anthropic Claude
-        # ============================================================================
-        'filename:.env ANTHROPIC_API_KEY NOT staging NOT example',
-        'filename:.env CLAUDE_API_KEY NOT sandbox NOT test',
-        'filename:.env.production ANTHROPIC_API_KEY',
-        'sk-ant-api03 NOT test NOT example NOT staging',
-        '"x-api-key" sk-ant- NOT test NOT example',
-        'anthropic_api_key language:python NOT test NOT example',
-
-        # ============================================================================
-        #                          3. Google Gemini / AI Studio
-        # ============================================================================
-        'filename:.env GEMINI_API_KEY NOT test NOT example',
-        'filename:.env GOOGLE_AI_KEY NOT staging',
-        'AIzaSy language:json NOT example NOT test NOT dev',
-        'AIzaSy language:python NOT test NOT example',
-        'generativelanguage.googleapis.com key= NOT test',
-
-        # ============================================================================
-        #                          4. Azure OpenAI
-        # ============================================================================
-        'filename:.env AZURE_OPENAI_API_KEY NOT staging NOT example',
-        'filename:.env AZURE_OPENAI_KEY NOT test',
-        'openai.azure.com api-key NOT example NOT test NOT staging',
-        'AZURE_OPENAI_ENDPOINT language:python NOT test',
-
-        # ============================================================================
-        #                          5. 中转站 / One-API / New-API
-        # ============================================================================
-        'filename:.env OPENAI_BASE_URL NOT sandbox NOT example',
-        'filename:.env BASE_URL openai NOT staging NOT test',
-        'filename:config.py ONEAPI NOT test',
-        'filename:config.py one-api NOT example',
-        'new-api sk- NOT test NOT demo NOT example',
-        'one-api sk- NOT test NOT demo',
-        'api.openai-proxy sk- NOT test',
-
-        # ============================================================================
-        #                          6. HuggingFace
-        # ============================================================================
-        'filename:.env HUGGINGFACE_API_KEY NOT test NOT example',
-        'filename:.env HF_TOKEN NOT staging',
-        'filename:.env HUGGINGFACE_TOKEN NOT test',
-        'hf_ language:python NOT test NOT example NOT mock',
-        '"Authorization: Bearer hf_" NOT test',
-
-        # ============================================================================
-        #                          7. Groq
-        # ============================================================================
-        'filename:.env GROQ_API_KEY NOT test NOT example',
-        'gsk_ language:python NOT test NOT example',
-        'api.groq.com Authorization NOT test',
-
-        # ============================================================================
-        #                          8. DeepSeek
-        # ============================================================================
-        'filename:.env DEEPSEEK_API_KEY NOT test NOT example',
-        'api.deepseek.com sk- NOT test NOT example',
-        'deepseek language:python sk- NOT test',
-
-        # ============================================================================
-        #                          9. 新兴 AI 平台
-        # ============================================================================
-        # Cohere
-        'filename:.env COHERE_API_KEY NOT test NOT example',
-        'cohere.ai api-key NOT test',
-
-        # Mistral
-        'filename:.env MISTRAL_API_KEY NOT test NOT example',
-        'api.mistral.ai NOT test NOT example',
-
-        # Together AI
-        'filename:.env TOGETHER_API_KEY NOT test',
-        'api.together.xyz NOT test NOT example',
-
-        # Replicate
-        'filename:.env REPLICATE_API_TOKEN NOT test',
-        'r8_ language:python NOT test NOT example',
-
-        # Perplexity
-        'filename:.env PERPLEXITY_API_KEY NOT test',
-        'pplx- language:python NOT test',
-
-        # Fireworks
-        'filename:.env FIREWORKS_API_KEY NOT test',
-        'fw_ language:python NOT test NOT example',
-
-        # ============================================================================
-        #                          10. 云服务商 API
-        # ============================================================================
-        # AWS
-        'filename:.env AWS_ACCESS_KEY_ID NOT test NOT example NOT staging',
-        'filename:.env AWS_SECRET_ACCESS_KEY NOT test NOT example',
-        'AKIA language:python NOT test NOT example NOT mock',
-
-        # GitHub Token
-        'filename:.env GITHUB_TOKEN NOT test NOT example',
-        'ghp_ language:python NOT test NOT example NOT mock',
-
-        # Stripe
-        'filename:.env STRIPE_SECRET_KEY NOT test NOT example',
-        'sk_live_ NOT test NOT example NOT staging',
-
-        # Twilio
-        'filename:.env TWILIO_AUTH_TOKEN NOT test NOT example',
-
-        # SendGrid
-        'filename:.env SENDGRID_API_KEY NOT test NOT example',
-        'SG. language:python NOT test NOT example',
-
-        # ============================================================================
-        #                          11. 高价值文件路径
-        # ============================================================================
-        'path:deploy/ .env NOT test NOT example',
-        'path:production/ .env NOT staging',
-        'path:config/ secrets NOT test NOT example',
-        'path:scripts/ api_key NOT test NOT example',
-        'filename:docker-compose.yml OPENAI NOT test',
-        'filename:docker-compose.yml API_KEY NOT example',
-        'filename:Dockerfile ENV OPENAI NOT test',
-    ])
+    query_templates: Dict[str, List[QueryTemplateSpec]] = field(default_factory=lambda: {
+        "strong_precision": [
+            {
+                "template": "{structural} {core} {negative}",
+                "structural": ["filename:.env", "filename:.env.local", "filename:.env.production"],
+                "core": ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+                "negative": ["NOT staging NOT sandbox NOT example", "NOT test NOT example"],
+            },
+            {
+                "template": "{structural} {core} {negative}",
+                "structural": ["filename:secrets.yaml", "filename:secrets.json", "filename:config.json"],
+                "core": ["openai_api_key", "sk-proj-"],
+                "negative": ["NOT example", "NOT test NOT example"],
+            },
+        ],
+        "medium_recall": [
+            {
+                "template": "{core} {structural} {negative}",
+                "core": ["sk-proj-", "sk-"],
+                "structural": ["language:python", "language:javascript"],
+                "negative": ["NOT test NOT example NOT mock", "NOT test NOT example NOT mock NOT staging"],
+            },
+            {
+                "template": "{core} {context} {negative}",
+                "core": ["sk-", "OPENAI_API_KEY="],
+                "context": ["one-api", "new-api", "relay", "api.openai-proxy"],
+                "negative": ["NOT test NOT demo NOT example", "NOT test NOT example NOT staging"],
+            },
+        ],
+        "low_frequency": [
+            {
+                "template": "{structural} {context} {negative}",
+                "structural": ["filename:config.py"],
+                "context": ["ONEAPI", "one-api", "endpoint", "proxy"],
+                "negative": ["NOT test", "NOT example"],
+            },
+        ],
+    })
     
+    # 搜索关键词兼容层：保留旧入口，供已有代码和外部脚本继续使用
+    search_keywords: List[str] = field(default_factory=list)
+
     # ==================== 平台默认 URL ====================
     default_base_urls: Dict[str, str] = field(default_factory=lambda: {
         # 主流 AI 平台
@@ -400,6 +454,14 @@ class Config:
         if self.proxy_url:
             return {"http": self.proxy_url, "https": self.proxy_url}
         return None
+
+    def proxy_pool_urls(self) -> List[str]:
+        """返回代理池地址列表"""
+        return list(self.proxy_urls)
+
+    def proxy_pool_urls(self) -> List[str]:
+        """返回代理池地址列表"""
+        return list(self.proxy_urls)
     
     def get_token(self) -> str:
         """获取当前 Token"""
@@ -419,6 +481,81 @@ class Config:
         if not self.github_tokens:
             return ""
         return random.choice(self.github_tokens)
+
+    def get_scheduled_search_keywords(self) -> List[str]:
+        """Expand template-driven boolean query graphs, dedupe them, then return high-value queries first."""
+        ordered_groups = ["strong_precision", "medium_recall", "low_frequency"]
+        expanded: List[str] = []
+        seen = set()
+
+        for group in ordered_groups:
+            for spec in self.query_templates.get(group, []):
+                template = str(spec.get("template", "")).strip()
+                if not template:
+                    continue
+
+                structural_terms: List[str] = spec.get("structural") or [""]
+                core_terms: List[str] = spec.get("core") or [""]
+                context_terms: List[str] = spec.get("context") or [""]
+                negative_terms: List[str] = spec.get("negative") or [""]
+
+                max_queries = 12 if group == "strong_precision" else 10 if group == "medium_recall" else 6
+                produced = 0
+
+                for structural in structural_terms:
+                    for core in core_terms:
+                        for context in context_terms:
+                            for negative in negative_terms:
+                                query = template.format(
+                                    structural=structural,
+                                    core=core,
+                                    context=context,
+                                    negative=negative,
+                                )
+                                query = " ".join(query.split())
+                                if not query or query in seen:
+                                    continue
+                                seen.add(query)
+                                expanded.append(query)
+                                produced += 1
+                                if produced >= max_queries:
+                                    break
+                            if produced >= max_queries:
+                                break
+                        if produced >= max_queries:
+                            break
+                    if produced >= max_queries:
+                        break
+
+        # Backward compatibility: allow ad-hoc legacy keywords to append if present.
+        for keyword in self.search_keywords:
+            normalized = " ".join(keyword.split())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            expanded.append(keyword)
+
+        scored = []
+        for keyword in expanded:
+            score, bucket, _reasons = score_search_keyword(keyword)
+            scored.append((score, bucket, keyword))
+
+        bucket_order = {"p0": 0, "p1": 1, "p2": 2, "p3": 3}
+        scored.sort(key=lambda item: (-item[0], bucket_order.get(item[1], 99), item[2]))
+        return [keyword for _, _, keyword in scored]
+    
+    @property
+    def enabled_detector_platforms(self) -> Set[str]:
+
+        platforms = set(self.enabled_providers)
+        if platforms.intersection({"relay", "oneapi", "newapi", "openai"}):
+            platforms.add("openai")
+        return platforms
+
+    def filter_platform_map(self, values: Dict[str, str]) -> Dict[str, str]:
+        """过滤正则/default url 等 platform 映射。"""
+        allowed = self.enabled_detector_platforms
+        return {key: value for key, value in values.items() if key.lower() in allowed}
 
 
 # 全局配置实例
@@ -462,3 +599,7 @@ except ImportError:
         print("   参考: config_local.py.example")
 except Exception as e:
     print(f"[WARNING] 加载 config_local.py 时出错: {e}")
+
+# 按 provider 白名单收敛 detector/default url，避免其他 provider 被额外源或提取逻辑误启用。
+REGEX_PATTERNS = config.filter_platform_map(REGEX_PATTERNS)
+config.default_base_urls = config.filter_platform_map(config.default_base_urls)

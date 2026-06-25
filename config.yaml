@@ -1,4 +1,4 @@
-# GitHub Secret Scanner Pro - 配置文件
+﻿# GitHub Secret Scanner Pro - 配置文件
 # 外部化配置,便于调整参数
 
 # ============================================================================
@@ -208,6 +208,20 @@ monitoring:
 
   # Prometheus 端口
   prometheus_port: 8000
+
+# ============================================================================
+#                          Redis 持久化缓存
+# ============================================================================
+redis:
+  # Redis 连接地址（可选）
+  # 设置后 L1/L2/L3 缓存自动持久化到 Redis
+  # 支持 redis:// 或 rediss:// 协议
+  url: ''
+
+  # 连接池设置
+  max_connections: 20
+  socket_timeout: 5.0
+  socket_connect_timeout: 3.0
 
   # 统计输出间隔 (秒)
   stats_interval: 60

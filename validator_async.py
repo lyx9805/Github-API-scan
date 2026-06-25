@@ -21,6 +21,40 @@ from async_database import AsyncDatabase
 from database import LeakedKey, KeyStatus
 
 
+def _to_leaked_key(item) -> LeakedKey:
+    """Normalize scanner queue items to the DB model used by the validator."""
+    if isinstance(item, LeakedKey):
+        return item
+    return LeakedKey(
+        platform=getattr(item, "platform", ""),
+        api_key=getattr(item, "api_key", ""),
+        base_url=getattr(item, "base_url", ""),
+        source_url=getattr(item, "source_url", ""),
+    )
+
+
+def _should_persist(status: KeyStatus) -> bool:
+    """Only keep keys with operator value; invalid candidates stay out of DB."""
+    return status in {
+        KeyStatus.VALID,
+        KeyStatus.QUOTA_EXCEEDED,
+        KeyStatus.CONNECTION_ERROR,
+        KeyStatus.UNVERIFIED,
+    }
+
+
+def _stat_name(status: KeyStatus) -> Optional[str]:
+    if status == KeyStatus.INVALID:
+        return "invalid_keys"
+    if status == KeyStatus.QUOTA_EXCEEDED:
+        return "quota_exceeded"
+    if status == KeyStatus.CONNECTION_ERROR:
+        return "connection_errors"
+    if status == KeyStatus.UNVERIFIED:
+        return "unverified_keys"
+    return "error_keys"
+
+
 async def async_validator_worker(
     result_queue: asyncio.Queue,
     async_db: AsyncDatabase,
@@ -58,15 +92,19 @@ async def async_validator_worker(
                 continue
 
             try:
-                # 检查是否已存在
+                key = _to_leaked_key(key)
+                if not key.api_key:
+                    continue
+
+                # 已入库说明之前验证后被保留过，跳过重复候选。
                 if await async_db.key_exists(key.api_key):
+                    processed_count += 1
+                    if dashboard:
+                        dashboard.increment_stat("skipped_existing")
                     logger.debug(f"[Validator-{worker_id}] Key 已存在,跳过: {key.api_key[:20]}...")
                     continue
 
-                # 先插入数据库 (状态为 pending)
-                await async_db.queue_insert(key)
-
-                # 异步验证
+                # 先验证；只有有效/配额耗尽/连接异常/无法验证等有保留价值的结果才入库。
                 status, balance, model_tier, rpm, is_high_value = await validate_key_async(
                     key.platform,
                     key.api_key,
@@ -74,36 +112,52 @@ async def async_validator_worker(
                     circuit_breaker=circuit_breaker
                 )
 
-                # 更新状态
-                await async_db.update_key_status(
-                    key.api_key,
-                    status,
-                    balance,
-                    model_tier,
-                    rpm,
-                    is_high_value
-                )
+                if _should_persist(status):
+                    key.status = status.value
+                    key.balance = balance
+                    key.model_tier = model_tier
+                    key.rpm = rpm
+                    key.is_high_value = is_high_value
+                    await async_db.insert_key_now(key)
+                    await async_db.update_key_status(
+                        key.api_key,
+                        status,
+                        balance,
+                        model_tier,
+                        rpm,
+                        is_high_value
+                    )
 
                 processed_count += 1
 
-                # 更新 UI
+                # 更新 UI / 统计。invalid 不入库，但要计入已验证结果。
                 if dashboard:
+                    stat_name = _stat_name(status)
+                    if stat_name:
+                        dashboard.increment_stat(stat_name)
+
                     if status == KeyStatus.VALID:
-                        dashboard.increment_valid()
+                        dashboard.add_valid_key(
+                            key.platform,
+                            key.api_key[:10] + "..." + key.api_key[-4:] if len(key.api_key) > 18 else key.api_key,
+                            balance,
+                            key.source_url,
+                            is_high_value,
+                        )
                         dashboard.add_log(
                             f"[✓] {key.platform} | {balance} | {key.api_key[:20]}...",
                             "SUCCESS"
                         )
                     elif status == KeyStatus.QUOTA_EXCEEDED:
-                        dashboard.increment_quota_exceeded()
                         dashboard.add_log(
                             f"[💰] {key.platform} | 配额耗尽 | {key.api_key[:20]}...",
                             "WARNING"
                         )
                     elif status == KeyStatus.INVALID:
-                        dashboard.increment_invalid()
-                    elif status == KeyStatus.CONNECTION_ERROR:
-                        dashboard.increment_connection_error()
+                        dashboard.add_log(
+                            f"[×] {key.platform} | 无效，未入库 | {key.api_key[:20]}...",
+                            "DEBUG"
+                        )
 
                 # 每处理 10 个 Key 输出一次统计
                 if processed_count % 10 == 0:
@@ -112,6 +166,7 @@ async def async_validator_worker(
             except Exception as e:
                 logger.error(f"[Validator-{worker_id}] 验证异常: {e}")
                 if dashboard:
+                    dashboard.increment_stat("error_keys")
                     dashboard.add_log(f"[✗] 验证错误: {str(e)[:50]}", "ERROR")
 
     except asyncio.CancelledError:

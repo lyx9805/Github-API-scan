@@ -1,0 +1,86 @@
+# GitHub Secret Scanner Pro - Docker Compose 配置
+# 使用方法:
+#   1. 复制 .env.example 为 .env 并填入配置
+#   2. docker compose up -d (后台启动)
+#   3. docker attach github-scanner (连接 TUI 界面, Ctrl+p Ctrl+q 退出)
+#   4. docker compose logs -f (查看日志)
+
+services:
+  scanner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: github-scanner
+    restart: unless-stopped
+
+    # 交互式 TUI 需要
+    stdin_open: true
+    tty: true
+
+    # 环境变量（从 .env 文件读取）
+    environment:
+      - GITHUB_TOKENS=${GITHUB_TOKENS:-}
+      - PROXY_URL=${PROXY_URL:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - SCANNER_LOG_PATH=/app/output/scanner.log
+      - RUNTIME_STATE_PATH=/app/output/runtime_state.json
+      - CUMULATIVE_STATS_PATH=/app/output/cumulative_stats.json
+      - MAX_SEARCH_RESULTS_PER_KEYWORD=${MAX_SEARCH_RESULTS_PER_KEYWORD:-100}
+      - ENABLED_PROVIDERS=${ENABLED_PROVIDERS:-openai,relay,oneapi,newapi}
+      - ENABLE_ALL_SOURCES=${ENABLE_ALL_SOURCES:-false}
+      - ENABLE_GIST=${ENABLE_GIST:-true}
+      - ENABLE_GITLAB=${ENABLE_GITLAB:-true}
+      - ENABLE_PASTEBIN=${ENABLE_PASTEBIN:-false}
+      - ENABLE_SEARCHCODE=${ENABLE_SEARCHCODE:-false}
+      - ENABLE_REALTIME=${ENABLE_REALTIME:-false}
+      - ENABLE_SOURCEGRAPH=${ENABLE_SOURCEGRAPH:-true}
+
+    # 数据持久化
+    volumes:
+      - scanner-data:/app/data
+      - ./output:/app/output
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+          cpus: '0.25'
+
+    networks:
+      - scanner-net
+
+  panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: github-scanner-panel
+    restart: unless-stopped
+    entrypoint: []
+    command: ["python", "-m", "uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      - PANEL_USERNAME=${PANEL_USERNAME:-admin}
+      - PANEL_PASSWORD=${PANEL_PASSWORD:-change-me-now}
+      - GITHUB_TOKENS=${GITHUB_TOKENS:-}
+      - SCANNER_LOG_PATH=/app/output/scanner.log
+      - RUNTIME_STATE_PATH=/app/output/runtime_state.json
+    ports:
+      - "18080:8080"
+    volumes:
+      - scanner-data:/app/data:ro
+      - ./output:/app/output:ro
+    depends_on:
+      - scanner
+    networks:
+      - scanner-net
+
+volumes:
+  scanner-data:
+    driver: local
+
+networks:
+  scanner-net:
+    driver: bridge

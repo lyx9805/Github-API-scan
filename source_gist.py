@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import aiohttp
 from aiohttp import ClientTimeout
 from github import Github, GithubException
+from loguru import logger
 
 from config import config, REGEX_PATTERNS
 from scanner import ScanResult, calculate_entropy, is_test_key, ENTROPY_THRESHOLD
@@ -96,6 +97,26 @@ class GistScanner:
         # aiohttp session
         self._session: Optional[aiohttp.ClientSession] = None
 
+    def _log(self, message: str, level: str = "INFO"):
+        logger.info(f"[Gist] {message}")
+        if self.dashboard:
+            self.dashboard.add_log(f"[Gist] {message}", level)
+
+    def _queue_put(self, item):
+        """同步放入队列，兼容 DynamicQueue 和 queue.Queue"""
+        try:
+            if hasattr(self.result_queue, 'put_nowait'):
+                ok = self.result_queue.put_nowait(item)
+                if ok is False:
+                    logger.warning("[Gist] 队列已满，丢弃结果")
+                return ok
+            else:
+                self.result_queue.put(item, timeout=5)
+                return True
+        except Exception as exc:
+            logger.warning(f"[Gist] 入队失败: {exc}")
+            return False
+
     def _init_github_clients(self):
         """初始化 GitHub 客户端"""
         if config.github_tokens:
@@ -116,11 +137,6 @@ class GistScanner:
     def _rotate_client(self):
         """轮换客户端"""
         self._current_client_index = (self._current_client_index + 1) % len(self._github_clients)
-
-    def _log(self, message: str, level: str = "INFO"):
-        """输出日志"""
-        if self.dashboard:
-            self.dashboard.add_log(f"[Gist] {message}", level)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取 aiohttp session"""
@@ -251,12 +267,12 @@ class GistScanner:
         results = self._extract_keys(content, gist_file.html_url)
 
         for result in results:
-            try:
-                self.result_queue.put(result, timeout=5)
+            if self._queue_put(result):
                 self.stats["keys_found"] += 1
+                if self.dashboard:
+                    self.dashboard.increment_stat("total_keys_found")
+                    self.dashboard.increment_source_found("gist")
                 self._log(f"发现 {result.platform.upper()} Key: {result.api_key[:12]}...", "FOUND")
-            except queue.Full:
-                pass
 
         return len(results)
 

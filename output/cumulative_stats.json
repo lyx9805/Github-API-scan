@@ -1,0 +1,14 @@
+{
+  "updated_at": "2026-06-23T12:52:46.973501",
+  "total_scanned": 1497,
+  "total_keys_found": 417,
+  "valid_keys": 0,
+  "invalid_keys": 228,
+  "quota_exceeded": 0,
+  "connection_errors": 0,
+  "skipped_low_entropy": 59,
+  "skipped_blacklist": 10,
+  "skipped_sha": 998012,
+  "skipped_file_filter": 371,
+  "skipped_existing": 0
+}

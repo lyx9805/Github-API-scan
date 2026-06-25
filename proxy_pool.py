@@ -26,6 +26,7 @@ class ProxyInfo:
     success_count: int = 0
     last_check: Optional[datetime] = None
     is_healthy: bool = True
+    health_score: float = 100.0
 
 
 class ProxyPool:
@@ -57,14 +58,17 @@ class ProxyPool:
         """移除代理"""
         self.proxies = [p for p in self.proxies if p.url != proxy_url]
 
+    def _recalculate_health(self, proxy: ProxyInfo):
+        proxy.health_score = max(0.0, min(100.0, 100.0 + proxy.success_count * 5 - proxy.fail_count * 20))
+        proxy.is_healthy = proxy.fail_count < self.max_fail_count and proxy.health_score > 0
+
     async def get_proxy(self) -> Optional[str]:
-        """获取下一个可用代理（轮询）"""
+        """获取下一个可用代理（按健康分优先）"""
         async with self._lock:
             healthy = [p for p in self.proxies if p.is_healthy]
             if not healthy:
                 return None
-
-            # 轮询选择
+            healthy.sort(key=lambda p: (p.health_score, p.success_count, -p.fail_count), reverse=True)
             self._index = (self._index + 1) % len(healthy)
             return healthy[self._index].url
 
@@ -81,7 +85,8 @@ class ProxyPool:
             if p.url == proxy_url:
                 p.success_count += 1
                 p.fail_count = 0
-                p.is_healthy = True
+                p.last_check = datetime.now()
+                self._recalculate_health(p)
                 break
 
     async def report_failure(self, proxy_url: str):
@@ -89,8 +94,9 @@ class ProxyPool:
         for p in self.proxies:
             if p.url == proxy_url:
                 p.fail_count += 1
-                if p.fail_count >= self.max_fail_count:
-                    p.is_healthy = False
+                p.last_check = datetime.now()
+                self._recalculate_health(p)
+                if not p.is_healthy:
                     logger.warning(f"代理标记为不健康: {proxy_url[:30]}...")
                 break
 
@@ -125,9 +131,11 @@ class ProxyPool:
                     "url": p.url[:30] + "...",
                     "healthy": p.is_healthy,
                     "success": p.success_count,
-                    "fail": p.fail_count
+                    "fail": p.fail_count,
+                    "health_score": round(p.health_score, 1),
+                    "last_check": p.last_check.isoformat() if p.last_check else None,
                 }
-                for p in self.proxies
+                for p in sorted(self.proxies, key=lambda x: (x.health_score, x.success_count), reverse=True)
             ]
         }
 

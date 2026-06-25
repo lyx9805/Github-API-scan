@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import ClientTimeout
+from loguru import logger
 
 from config import config, REGEX_PATTERNS
 from scanner import ScanResult, calculate_entropy, is_test_key, ENTROPY_THRESHOLD
@@ -73,8 +74,24 @@ class GitLabScanner:
         self._session: Optional[aiohttp.ClientSession] = None
 
     def _log(self, message: str, level: str = "INFO"):
+        logger.info(f"[GitLab] {message}")
         if self.dashboard:
             self.dashboard.add_log(f"[GitLab] {message}", level)
+
+    def _queue_put(self, item):
+        """同步放入队列，兼容 DynamicQueue 和 queue.Queue"""
+        try:
+            if hasattr(self.result_queue, 'put_nowait'):
+                ok = self.result_queue.put_nowait(item)
+                if ok is False:
+                    logger.warning("[GitLab] 队列已满，丢弃结果")
+                return ok
+            else:
+                self.result_queue.put(item, timeout=5)
+                return True
+        except Exception as exc:
+            logger.warning(f"[GitLab] 入队失败: {exc}")
+            return False
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -86,28 +103,40 @@ class GitLabScanner:
             await self._session.close()
 
     async def _search_snippets(self, keyword: str) -> List[SnippetInfo]:
-        """搜索公开 Snippets"""
+        """搜索公开 Snippets - 网页抓取方式（API 已要求认证）"""
         snippets = []
         try:
             session = await self._get_session()
-            url = f"{GITLAB_API}/snippets/public"
-            params = {"per_page": 50}
+            # GitLab public snippets API 要求认证，改用 explore 页面抓取
+            url = "https://gitlab.com/explore/snippets"
             proxy = config.proxy_url if config.proxy_url else None
 
-            async with session.get(url, params=params, proxy=proxy) as resp:
+            async with session.get(url, proxy=proxy) as resp:
                 if resp.status != 200:
+                    self._log(f"explore/snippets 返回 {resp.status}", "ERROR")
                     return []
 
-                data = await resp.json()
-                for item in data:
+                html = await resp.text()
+                # 解析 snippet 链接: /<user>/<project>/-/snippets/<id>
+                import re as _re
+                pattern = _re.compile(r'href="(/[^"]+/snippets/(\d+))"')
+                seen = set()
+                for match in pattern.finditer(html):
+                    path = match.group(1)
+                    sid = int(match.group(2))
+                    if sid in seen:
+                        continue
+                    seen.add(sid)
+                    web_url = f"https://gitlab.com{path}"
+                    raw_url = f"https://gitlab.com{path}/raw"
                     snippets.append(SnippetInfo(
-                        id=item.get("id", 0),
-                        title=item.get("title", ""),
-                        web_url=item.get("web_url", ""),
-                        raw_url=item.get("raw_url", "")
+                        id=sid,
+                        title="",
+                        web_url=web_url,
+                        raw_url=raw_url
                     ))
         except Exception as e:
-            self._log(f"搜索异常: {type(e).__name__}", "ERROR")
+            self._log(f"搜索异常: {type(e).__name__}: {e}", "ERROR")
 
         return snippets
 
@@ -173,13 +202,13 @@ class GitLabScanner:
 
         found = 0
         for result in results:
-            try:
-                self.result_queue.put(result, timeout=5)
+            if self._queue_put(result):
                 found += 1
                 self.stats["keys_found"] += 1
+                if self.dashboard:
+                    self.dashboard.increment_stat("total_keys_found")
+                    self.dashboard.increment_source_found("gitlab")
                 self._log(f"发现 {result.platform.upper()}: {result.api_key[:15]}...", "FOUND")
-            except queue.Full:
-                pass
 
         return found
 

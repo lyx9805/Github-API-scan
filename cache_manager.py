@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 智能缓存管理器 - v2.2 新增
@@ -16,6 +16,8 @@
 
 import asyncio
 import hashlib
+import json
+import os
 import time
 from typing import Optional, Dict, Any, Set
 from dataclasses import dataclass, field
@@ -46,7 +48,9 @@ class CacheConfig:
 
     # 缓存清理间隔
     cleanup_interval: float = 300.0  # 5分钟
-
+    redis_url: str = field(
+        default_factory=lambda: os.getenv('REDIS_URL', '')
+    )分钟
 
 class DomainHealth(Enum):
     """域名健康状态"""
@@ -404,12 +408,29 @@ _cache_manager: Optional[CacheManager] = None
 
 
 async def get_cache_manager(
-    config: Optional[CacheConfig] = None
+    config: Optional[CacheConfig] = None,
+    redis_url: str = '',
 ) -> CacheManager:
-    """获取全局缓存管理器实例"""
+    """获取全局缓存管理器实例（自动选择后端）
+
+    Args:
+        config: 缓存配置（可选）
+        redis_url: Redis 连接地址。设置后自动启用 Redis 持久化缓存。
+    """
     global _cache_manager
 
     if _cache_manager is None:
+        effective_redis = redis_url or (config.redis_url if config else '') or os.getenv('REDIS_URL', '')
+        if effective_redis:
+            try:
+                from redis_cache import RedisCacheManager, RedisSettings
+                _cache_manager = RedisCacheManager(config, RedisSettings(url=effective_redis))
+                await _cache_manager.start()
+                return _cache_manager
+            except Exception as exc:
+                from loguru import logger
+                logger.warning(f'Redis 缓存初始化失败，降级为内存: {exc}')
+
         _cache_manager = CacheManager(config)
         await _cache_manager.start()
 

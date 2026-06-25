@@ -16,6 +16,8 @@ import time
 import queue
 import asyncio
 import threading
+import urllib.request
+import json
 from datetime import datetime, timezone
 from typing import Optional, List, Set, Tuple
 from dataclasses import dataclass
@@ -26,12 +28,16 @@ from functools import lru_cache
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
 from github import Github, GithubException, RateLimitExceededException
+from loguru import logger
 
 from config import (
-    config, REGEX_PATTERNS, BASE_URL_PATTERNS, 
-    AZURE_URL_PATTERN, AZURE_CONTEXT_KEYWORDS, URL_PRIORITY_KEYWORDS
+    config, REGEX_PATTERNS, BASE_URL_PATTERNS,
+    AZURE_URL_PATTERN, AZURE_CONTEXT_KEYWORDS, URL_PRIORITY_KEYWORDS, score_search_keyword
 )
+from proxy_pool import init_proxy_pool, get_proxy_pool
 from database import Database, LeakedKey, KeyStatus
+
+
 
 
 # ============================================================================
@@ -386,9 +392,13 @@ class GitHubScanner:
         self._github_clients: List[Github] = []
         self._current_client_index = 0
         self._client_lock = threading.Lock()
+        self._max_results_per_keyword = int(os.getenv("MAX_SEARCH_RESULTS_PER_KEYWORD", "1000"))
+        self._token_quota = {}
+        self._request_backoff_until = 0.0
+        self._request_backoff_seconds = 0.0
         
         self._init_github_clients()
-        
+
         # 已处理的 Key 集合（内存缓存，加速查询）
         self._processed_keys: Set[str] = set()
         self._processed_lock = threading.Lock()
@@ -431,7 +441,11 @@ class GitHubScanner:
     
     def _init_github_clients(self):
         """初始化 GitHub 客户端池"""
-        if config.proxy_url:
+        if getattr(config, "proxy_urls", None):
+            init_proxy_pool(config.proxy_urls)
+            os.environ.pop('HTTP_PROXY', None)
+            os.environ.pop('HTTPS_PROXY', None)
+        elif config.proxy_url:
             os.environ['HTTP_PROXY'] = config.proxy_url
             os.environ['HTTPS_PROXY'] = config.proxy_url
         else:
@@ -442,12 +456,12 @@ class GitHubScanner:
             for token in config.github_tokens:
                 client = Github(
                     login_or_token=token,
-                    per_page=30,
+                    per_page=100,
                     timeout=config.request_timeout,
                 )
                 self._github_clients.append(client)
         else:
-            client = Github(per_page=30, timeout=config.request_timeout)
+            client = Github(per_page=100, timeout=config.request_timeout)
             self._github_clients.append(client)
     
     def _get_github_client(self) -> Github:
@@ -458,7 +472,147 @@ class GitHubScanner:
         with self._client_lock:
             self._current_client_index = (self._current_client_index + 1) % len(self._github_clients)
             return self._current_client_index
-    
+
+    def _token_quota_entry(self, index: int) -> dict:
+        return self._token_quota.setdefault(index, {
+            "remaining": None,
+            "limit": None,
+            "reset": None,
+            "disabled_until": 0.0,
+            "last_checked": 0.0,
+            "last_error": "",
+            "success_count": 0,
+            "failure_count": 0,
+            "rate_limit_count": 0,
+            "health_score": 100.0,
+            "last_success_at": 0.0,
+        })
+
+    def _refresh_token_quota(self, index: int, force: bool = False) -> dict:
+        """刷新单个 token 的 Code Search 配额缓存。"""
+        entry = self._token_quota_entry(index)
+        now_ts = time.time()
+        if not force and now_ts - entry.get("last_checked", 0) < 15:
+            return entry
+        try:
+            headers = {
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "github-api-scan/2.2",
+            }
+            if config.github_tokens and index < len(config.github_tokens):
+                headers["Authorization"] = f"Bearer {config.github_tokens[index]}"
+            req = urllib.request.Request("https://api.github.com/rate_limit", headers=headers)
+            with urllib.request.urlopen(req, timeout=config.request_timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            resources = data.get("resources", {})
+            search = resources.get("code_search") or resources.get("search") or {}
+            remaining = int(search.get("remaining") or 0)
+            limit = int(search.get("limit") or 0)
+            reset_ts = float(search.get("reset") or 0.0)
+            entry.update({
+                "remaining": remaining,
+                "limit": limit,
+                "reset": reset_ts,
+                "disabled_until": reset_ts + 5 if remaining <= 0 and reset_ts else 0.0,
+                "last_checked": now_ts,
+                "last_error": "",
+            })
+        except Exception as exc:
+            entry.update({
+                "remaining": 0,
+                "disabled_until": now_ts + 30,
+                "last_checked": now_ts,
+                "last_error": type(exc).__name__,
+            })
+        return entry
+
+    def _record_token_success(self, index: int):
+        entry = self._token_quota_entry(index)
+        entry["success_count"] = int(entry.get("success_count", 0)) + 1
+        entry["failure_count"] = max(0, int(entry.get("failure_count", 0)) - 1)
+        entry["last_success_at"] = time.time()
+        entry["health_score"] = min(100.0, float(entry.get("health_score", 100.0)) + 5.0)
+
+    def _record_token_failure(self, index: int, reason: str = "error", cooldown: float = 0.0):
+        entry = self._token_quota_entry(index)
+        entry["failure_count"] = int(entry.get("failure_count", 0)) + 1
+        entry["last_error"] = reason
+        entry["health_score"] = max(5.0, float(entry.get("health_score", 100.0)) - 15.0)
+        if cooldown > 0:
+            entry["disabled_until"] = max(float(entry.get("disabled_until", 0.0)), time.time() + cooldown)
+
+    def _record_token_rate_limit(self, index: int, cooldown: float = 60.0):
+        entry = self._token_quota_entry(index)
+        entry["rate_limit_count"] = int(entry.get("rate_limit_count", 0)) + 1
+        entry["remaining"] = 0
+        entry["last_error"] = "rate_limit"
+        entry["health_score"] = max(0.0, float(entry.get("health_score", 100.0)) - 25.0)
+        entry["disabled_until"] = max(float(entry.get("disabled_until", 0.0)), time.time() + cooldown)
+
+    def _apply_request_backoff(self, base_seconds: float, reason: str):
+        self._request_backoff_seconds = min(120.0, max(base_seconds, self._request_backoff_seconds * 1.8 if self._request_backoff_seconds else base_seconds))
+        self._request_backoff_until = time.time() + self._request_backoff_seconds
+        self._log(f"请求退避 {self._request_backoff_seconds:.0f}s ({reason})", "WARN")
+
+    def _wait_for_request_backoff(self):
+        while self._request_backoff_until > time.time() and not self.stop_event.is_set():
+            remaining = self._request_backoff_until - time.time()
+            time.sleep(min(5, remaining))
+
+    def _relax_request_backoff(self):
+        if self._request_backoff_seconds <= 0:
+            return
+        self._request_backoff_seconds = max(0.0, self._request_backoff_seconds * 0.5 - 1.0)
+        if self._request_backoff_seconds <= 0:
+            self._request_backoff_until = 0.0
+        else:
+            self._request_backoff_until = max(self._request_backoff_until, time.time() + min(self._request_backoff_seconds, 5.0))
+
+    def _mark_current_token_exhausted(self):
+        """把当前 token 临时标记为 code_search 不可用。"""
+        index = self._current_client_index % len(self._github_clients)
+        entry = self._refresh_token_quota(index, force=True)
+        if not entry.get("disabled_until"):
+            entry["disabled_until"] = time.time() + 60
+        entry["remaining"] = 0
+
+    def _select_available_client(self) -> bool:
+        """选择还有 Code Search 配额且健康度更高的客户端。"""
+        if not self._github_clients:
+            return False
+        now_ts = time.time()
+        best_wait_until = None
+        best_index = None
+        best_score = None
+        start = self._current_client_index % len(self._github_clients)
+        for offset in range(len(self._github_clients)):
+            index = (start + offset) % len(self._github_clients)
+            entry = self._token_quota_entry(index)
+            if entry.get("disabled_until", 0) > now_ts:
+                best_wait_until = min(best_wait_until or entry["disabled_until"], entry["disabled_until"])
+                continue
+            entry = self._refresh_token_quota(index)
+            if (entry.get("remaining") or 0) <= 0:
+                if entry.get("disabled_until", 0) > now_ts:
+                    best_wait_until = min(best_wait_until or entry["disabled_until"], entry["disabled_until"])
+                continue
+            health_score = float(entry.get("health_score", 100.0))
+            remaining = float(entry.get("remaining") or 0)
+            composite = health_score * 1000.0 + remaining
+            if best_score is None or composite > best_score:
+                best_score = composite
+                best_index = index
+        if best_index is not None:
+            with self._client_lock:
+                self._current_client_index = best_index
+            if self.dashboard:
+                self.dashboard.update_stats(current_token_index=best_index, total_tokens=len(self._github_clients))
+            return True
+        if best_wait_until:
+            wait = max(0, best_wait_until - now_ts)
+            self._log(f"所有 Token 的 Code Search 配额暂时不可用，约 {wait:.0f}s 后恢复", "WARN")
+        return False
+
     def _preload_scanned_shas(self):
         """
         从数据库预加载已扫描的 SHA 到内存缓存
@@ -505,22 +659,37 @@ class GitHubScanner:
         """
         异步下载文件内容
         
-        使用 aiohttp 替代 requests，大幅提升下载速度
+        使用 aiohttp 替代 requests，大幅提升速度
         """
         async with self._async_semaphore:
+            proxy_pool = get_proxy_pool()
+            proxy = None
+            if proxy_pool and proxy_pool.has_healthy_proxy:
+                proxy = await proxy_pool.get_proxy()
+            elif config.proxy_url:
+                proxy = config.proxy_url
+
             try:
                 session = await self._get_aiohttp_session()
-                proxy = config.proxy_url if config.proxy_url else None
-                
                 async with session.get(raw_url, proxy=proxy) as resp:
                     if resp.status == 200:
+                        if proxy_pool and proxy:
+                            await proxy_pool.report_success(proxy)
                         return await resp.text(errors='ignore')
+                    if proxy_pool and proxy:
+                        await proxy_pool.report_failure(proxy)
                     return None
             except asyncio.TimeoutError:
+                if proxy_pool and proxy:
+                    await proxy_pool.report_failure(proxy)
                 return None
             except aiohttp.ClientError:
+                if proxy_pool and proxy:
+                    await proxy_pool.report_failure(proxy)
                 return None
             except Exception:
+                if proxy_pool and proxy:
+                    await proxy_pool.report_failure(proxy)
                 return None
     
     async def _async_download_batch(
@@ -573,7 +742,8 @@ class GitHubScanner:
         with self._processed_lock:
             if api_key in self._processed_keys:
                 return True
-            if self.db.key_exists(api_key):
+            key_exists = getattr(self.db, "key_exists_sync", self.db.key_exists)
+            if key_exists(api_key):
                 self._processed_keys.add(api_key)
                 return True
             return False
@@ -598,7 +768,8 @@ class GitHubScanner:
                 return True
         
         # 2. 数据库检查（持久化）
-        if self.db.is_blob_scanned(sha):
+        is_blob_scanned = getattr(self.db, "is_blob_scanned_sync", self.db.is_blob_scanned)
+        if is_blob_scanned(sha):
             # 同步到内存缓存
             with self._sha_lock:
                 self._processed_shas.add(sha)
@@ -621,12 +792,18 @@ class GitHubScanner:
             self._processed_shas.add(sha)
         
         # 2. 持久化到数据库
-        self.db.mark_blob_scanned(sha)
+        mark_blob_scanned = getattr(self.db, "mark_blob_scanned_sync", self.db.mark_blob_scanned)
+        mark_blob_scanned(sha)
     
     def _log(self, message: str, level: str = "INFO"):
-        """输出日志到仪表盘"""
+        """输出日志到仪表盘和 loguru（确保 Docker 容器日志可见）"""
         if self.dashboard:
             self.dashboard.add_log(message, level)
+        # 同时写到 loguru，Docker 容器日志可见
+        from loguru import logger as _logger
+        lvl = level.lower() if level else "info"
+        log_fn = getattr(_logger, lvl, _logger.info)
+        log_fn(f"[GitHubScanner] {message}")
     
     # ========================================================================
     #                           过滤逻辑
@@ -852,7 +1029,8 @@ class GitHubScanner:
                 
                 # 2. 数据库预检查（在任何其他处理前，提前丢弃已入库 Key）
                 # 这一步可减轻下游验证队列压力
-                if self.db.key_exists(api_key):
+                key_exists = getattr(self.db, "key_exists_sync", self.db.key_exists)
+                if key_exists(api_key):
                     self._mark_key_processed(api_key)
                     continue
                 
@@ -910,34 +1088,26 @@ class GitHubScanner:
     # ========================================================================
     
     def _handle_rate_limit(self) -> bool:
-        """处理速率限制"""
-        try:
-            if len(self._github_clients) > 1:
-                self._rotate_client()
-                next_client = self._get_github_client()
-                rate_limit = next_client.get_rate_limit()
-                if rate_limit.search.remaining > 0:
-                    return True
-            
-            client = self._get_github_client()
-            rate_limit = client.get_rate_limit()
-            
-            if rate_limit.search.remaining == 0:
-                reset_time = rate_limit.search.reset
-                now = datetime.now(timezone.utc)
-                sleep_seconds = (reset_time - now).total_seconds() + 5
-                
-                if sleep_seconds > 0:
-                    self._log(f"配额耗尽，等待 {sleep_seconds:.0f}s...", "WARN")
-                    while sleep_seconds > 0 and not self.stop_event.is_set():
-                        time.sleep(min(10, sleep_seconds))
-                        sleep_seconds -= 10
+        """处理速率限制：优先切换到健康且仍有 code_search 配额的 token。"""
+        index = self._current_client_index % len(self._github_clients)
+        self._record_token_rate_limit(index, cooldown=60.0)
+        self._mark_current_token_exhausted()
+        self._apply_request_backoff(15.0, "rate_limit")
+        if self._select_available_client():
             return True
-        except Exception as e:
-            self._rotate_client()
-            time.sleep(3)
-            return True
-    
+
+        waits = [
+            entry.get("disabled_until", 0) - time.time()
+            for entry in self._token_quota.values()
+            if entry.get("disabled_until", 0) > time.time()
+        ]
+        sleep_seconds = max(5, min(waits) if waits else 30)
+        self._log(f"全部 Token Code Search 配额耗尽，等待 {sleep_seconds:.0f}s...", "WARN")
+        while sleep_seconds > 0 and not self.stop_event.is_set():
+            time.sleep(min(10, sleep_seconds))
+            sleep_seconds -= 10
+        return True
+
     def search_keyword(self, keyword: str) -> int:
         """
         搜索单个关键词
@@ -945,6 +1115,7 @@ class GitHubScanner:
         优化：使用 aiohttp 异步批量下载文件内容，大幅提升速度
         """
         found_count = 0
+        current_index = self._current_client_index % len(self._github_clients) if self._github_clients else 0
         
         if self.dashboard:
             self.dashboard.update_stats(
@@ -954,19 +1125,30 @@ class GitHubScanner:
             )
         
         try:
+            self._wait_for_request_backoff()
             self._log(f"搜索 \"{keyword}\"...", "SCAN")
             
             # GitHub Dorks 语法不需要额外的 in:file
             query = keyword if any(x in keyword for x in ['filename:', 'path:', 'language:']) else f"{keyword} in:file"
+            if not self._select_available_client():
+                self._handle_rate_limit()
+                return found_count
+
+            current_index = self._current_client_index % len(self._github_clients)
             client = self._get_github_client()
             code_results = client.search_code(query)
-            
+            self._record_token_success(current_index)
+            self._relax_request_backoff()
+
             # ========== 优化：批量收集文件元数据 + 多层过滤 ==========
             # 批量大小从 50 降至 40，减少长尾阻塞
             batch_size = 40
             files_batch = []
             
             for i, code_file in enumerate(code_results):
+                if i >= self._max_results_per_keyword:
+                    self._log(f"关键词结果达到上限 {self._max_results_per_keyword}，切换下一个关键词", "INFO")
+                    break
                 if self.stop_event.is_set():
                     break
                 
@@ -975,6 +1157,8 @@ class GitHubScanner:
                     file_sha = getattr(code_file, 'sha', None)
                     if file_sha and self._is_sha_processed(file_sha):
                         self.stats["skipped_sha"] += 1
+                        if self.dashboard:
+                            self.dashboard.increment_stat("skipped_sha")
                         continue
                     
                     # ===== 2. 文件路径/大小过滤 =====
@@ -984,6 +1168,8 @@ class GitHubScanner:
                     skip_file, skip_reason = should_skip_file(file_path, file_size)
                     if skip_file:
                         self.stats["skipped_file_filter"] += 1
+                        if self.dashboard:
+                            self.dashboard.increment_stat("skipped_file_filter")
                         if file_sha:
                             self._mark_sha_processed(file_sha)  # 标记为已处理，下次不再检查
                         continue
@@ -1003,8 +1189,8 @@ class GitHubScanner:
                         try:
                             content = code_file.decoded_content.decode('utf-8', errors='ignore')
                             found_count += self._process_downloaded_file(html_url, content, found_count)
-                        except Exception as e:
-                            logger.debug(f"异常: {type(e).__name__}")
+                        except Exception:
+                            logger.debug("异常: decoded_content_fallback_failed")
                     
                     # 达到批量大小，执行异步下载
                     if len(files_batch) >= batch_size:
@@ -1026,17 +1212,28 @@ class GitHubScanner:
             self._log("速率限制，切换 Token...", "WARN")
             self._handle_rate_limit()
         except GithubException as e:
-            if "rate limit" in str(e).lower():
+            error_text = str(e).lower()
+            is_rate_limited = (
+                "rate limit" in error_text
+                or "api rate limit exceeded" in error_text
+                or getattr(e, "status", None) == 403
+            )
+            if is_rate_limited:
+                self._log("Code Search 配额耗尽，进入等待/切换 Token", "WARN")
                 self._handle_rate_limit()
             else:
-                self._log(f"API 错误: {str(e)[:30]}", "ERROR")
+                self._record_token_failure(current_index, reason=f"github:{getattr(e, 'status', 'error')}", cooldown=20.0)
+                self._apply_request_backoff(8.0, "github_error")
+                self._log(f"API 错误: {str(e)[:60]}", "ERROR")
                 self._rotate_client()
         except Exception as e:
+            self._record_token_failure(current_index, reason=type(e).__name__, cooldown=10.0)
+            self._apply_request_backoff(5.0, type(e).__name__)
             self._log(f"搜索错误: {str(e)[:30]}", "ERROR")
             self._rotate_client()
         
         return found_count
-    
+
     def _process_file_batch(self, files_batch: List[Tuple[str, str, any]]) -> int:
         """
         异步批量处理文件
@@ -1099,6 +1296,7 @@ class GitHubScanner:
             
             if self.dashboard:
                 self.dashboard.increment_stat("total_keys_found")
+                self.dashboard.increment_source_found("github")
                 self.dashboard.add_log(
                     f"发现 {result.platform.upper()} Key: {mask_key(result.api_key)}",
                     "FOUND"
@@ -1114,9 +1312,16 @@ class GitHubScanner:
             resume: 是否从断点续传
         """
         round_num = 0
-        keywords = config.search_keywords
+        keywords = config.get_scheduled_search_keywords()
         total_keywords = len(keywords)
-        
+
+        if self.dashboard and keywords:
+            top_keywords = keywords[:5]
+            self._log(
+                "优先级最高的关键词: " + " | ".join(top_keywords),
+                "INFO"
+            )
+
         # 断点续传：加载上次进度
         start_index = 0
         if resume:
@@ -1126,30 +1331,37 @@ class GitHubScanner:
                 self._log(f"从断点恢复: 关键词 {start_index + 1}/{total_keywords}", "INFO")
             else:
                 self._log("未找到有效的断点，从头开始扫描", "INFO")
-        
+
         while not self.stop_event.is_set():
             round_num += 1
-            
+            scan_run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-r{round_num}"
+            if self.dashboard and hasattr(self.dashboard, "start_scan_run"):
+                self.dashboard.start_scan_run(scan_run_id, round_num, total_keywords)
+            self._log(f"SCAN_RUN_START {scan_run_id} 第 {round_num} 轮，共 {total_keywords} 个关键词", "SCAN")
+
             for i, keyword in enumerate(keywords):
                 if self.stop_event.is_set():
                     break
-                
+
                 # 断点续传：跳过已完成的关键词（仅第一轮）
                 if round_num == 1 and i < start_index:
                     continue
-                
-                self.search_keyword(keyword)
-                self._rotate_client()
-                
+
+                if self.dashboard:
+                    self.dashboard.update_stats(round_keyword_index=i + 1, round_total_keywords=total_keywords)
+                found_count = self.search_keyword(keyword)
+                if self.dashboard and hasattr(self.dashboard, '_record_query_quality'):
+                    self.dashboard._record_query_quality(keyword, scanned=1, found=found_count, valid=0)
+
                 # 保存进度
                 self.db.save_progress(i + 1, total_keywords, is_completed=(i + 1 == total_keywords))
-                
+
                 if not self.stop_event.is_set():
                     time.sleep(0.5)
-            
+
             # 本轮完成，标记进度
             self.db.save_progress(total_keywords, total_keywords, is_completed=True)
-            
+
             # 等待下一轮
             if not self.stop_event.is_set():
                 self._log(f"第 {round_num} 轮完成，等待 2 分钟...", "INFO")
@@ -1157,7 +1369,7 @@ class GitHubScanner:
                     if self.stop_event.is_set():
                         break
                     time.sleep(10)
-                
+
                 # 新一轮重置进度
                 self.db.reset_progress()
 

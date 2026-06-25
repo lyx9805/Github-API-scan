@@ -34,6 +34,7 @@ from config import (
 )
 from database import Database, LeakedKey, KeyStatus
 from connection_pool import get_connection_pool
+from proxy_pool import get_next_proxy, get_proxy_pool
 from retry_handler import RetryHandler, RetryConfig, ErrorType
 
 # v2.2: 缓存和批量验证
@@ -137,6 +138,15 @@ class OptimizedAsyncValidator:
 
     def _get_proxy(self) -> Optional[str]:
         """获取代理 URL"""
+        pool = get_proxy_pool()
+        if pool and pool.has_healthy_proxy:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    return None
+                return loop.run_until_complete(get_next_proxy())
+            except Exception:
+                pass
         return config.proxy_url if config.proxy_url else None
 
     def _log(self, message: str, level: str = "INFO"):
@@ -263,6 +273,7 @@ class OptimizedAsyncValidator:
         新增：使用重试处理器自动重试临时错误
         """
         session = await self._get_session(url)
+        proxy_pool = get_proxy_pool()
 
         async def _do_request():
             if method.upper() == 'GET':
@@ -272,12 +283,14 @@ class OptimizedAsyncValidator:
             else:
                 raise ValueError(f"不支持的 HTTP 方法: {method}")
 
-        # 使用重试处理器
         try:
             response = await self._retry_handler.execute_with_retry(_do_request)
+            if proxy_pool and proxy:
+                await proxy_pool.report_success(proxy)
             return response
         except Exception as e:
-            # 记录重试统计
+            if proxy_pool and proxy:
+                await proxy_pool.report_failure(proxy)
             error_type = self._retry_handler.classify_error(e)
             if error_type == ErrorType.RETRYABLE:
                 self._stats['retried_validations'] += 1

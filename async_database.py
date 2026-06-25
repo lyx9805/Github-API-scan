@@ -117,6 +117,22 @@ class AsyncDatabase:
             if len(self._write_queue) >= self._batch_size:
                 asyncio.create_task(self._flush_queue())
 
+    async def insert_key_now(self, key: LeakedKey) -> bool:
+        """立即插入 Key，供验证器使用，避免先 update 后批量 insert 的时序问题。"""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT OR IGNORE INTO leaked_keys
+                (platform, api_key, base_url, status, balance, source_url, model_tier, rpm, is_high_value, found_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key.platform, key.api_key, key.base_url, key.status,
+                key.balance, key.source_url, key.model_tier, key.rpm,
+                1 if key.is_high_value else 0,
+                key.found_time.isoformat() if key.found_time else datetime.now().isoformat()
+            ))
+            await db.commit()
+            return cursor.rowcount > 0
+
     async def key_exists(self, api_key: str) -> bool:
         """检查 Key 是否存在"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -192,6 +208,118 @@ class AsyncDatabase:
             "statuses": statuses,
             "platforms": platforms
         }
+
+    # ====================================================================
+    # 同步兼容方法（供 scanner.py 等同步模块调用）
+    # ====================================================================
+
+    def save_progress(self, current_index: int, total: int, is_completed: bool = False):
+        """保存扫描进度（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scan_progress (
+                    id INTEGER PRIMARY KEY, current_index INTEGER,
+                    total INTEGER, is_completed BOOLEAN, update_time DATETIME
+                )
+            """)
+            cursor.execute("""
+                INSERT OR REPLACE INTO scan_progress (id, current_index, total, is_completed, update_time)
+                VALUES (1, ?, ?, ?, ?)
+            """, (current_index, total, 1 if is_completed else 0, datetime.now().isoformat()))
+            conn.commit()
+
+    def load_progress(self) -> dict:
+        """加载扫描进度（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS scan_progress (
+                    id INTEGER PRIMARY KEY, current_index INTEGER,
+                    total INTEGER, is_completed BOOLEAN, update_time DATETIME
+                )
+            """)
+            conn.commit()
+            cursor.execute("SELECT current_index, total, is_completed FROM scan_progress WHERE id = 1")
+            row = cursor.fetchone()
+            if row:
+                return {"current_index": row[0], "total": row[1], "is_completed": bool(row[2])}
+            return {"current_index": 0, "total": 0, "is_completed": False}
+
+    def reset_progress(self):
+        """重置扫描进度（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM scan_progress WHERE id = 1")
+            conn.commit()
+
+    def key_exists_sync(self, api_key: str) -> bool:
+        """检查 Key 是否存在（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM leaked_keys WHERE api_key = ? LIMIT 1", (api_key,))
+            return cursor.fetchone() is not None
+
+    def insert_key(self, key: 'LeakedKey') -> bool:
+        """插入 Key（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO leaked_keys
+                    (platform, api_key, base_url, status, balance, source_url, model_tier, rpm, is_high_value, found_time)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (key.platform, key.api_key, key.base_url, key.status, key.balance,
+                      key.source_url, key.model_tier, key.rpm, key.is_high_value, key.found_time))
+                conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                return False
+
+    def update_key_status_sync(self, api_key: str, status, balance: str = '', **kwargs):
+        """更新 Key 状态（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            status_val = status.value if hasattr(status, 'value') else str(status)
+            model_tier = kwargs.get('model_tier', '')
+            rpm = kwargs.get('rpm', 0)
+            is_high_value = kwargs.get('is_high_value', False)
+            cursor.execute("""
+                UPDATE leaked_keys SET status=?, balance=?, model_tier=?, rpm=?, is_high_value=?, verified_time=?
+                WHERE api_key=?
+            """, (status_val, balance, model_tier, rpm, 1 if is_high_value else 0,
+                  datetime.now().isoformat(), api_key))
+            conn.commit()
+
+    def is_blob_scanned_sync(self, file_sha: str) -> bool:
+        """检查文件是否已扫描（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM scanned_blobs WHERE file_sha = ? LIMIT 1", (file_sha,))
+            return cursor.fetchone() is not None
+
+    def mark_blob_scanned_sync(self, file_sha: str):
+        """标记文件已扫描（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO scanned_blobs (file_sha) VALUES (?)", (file_sha,))
+            conn.commit()
+
+    def get_scanned_blob_count(self) -> int:
+        """获取已扫描文件数量（同步兼容）"""
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM scanned_blobs")
+            return cursor.fetchone()[0]
 
 
 def try_enable_uvloop():
