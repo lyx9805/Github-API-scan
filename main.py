@@ -231,40 +231,39 @@ class SecretScanner:
             dashboard=self.dashboard
         )
 
-        # 可选源扫描器
         if self.enable_pastebin:
             self.pastebin_thread = start_pastebin_scanner(
-                self.result_queue, self.db, self.stop_event,
+                self.result_queue, self.stop_event,
                 dashboard=self.dashboard, api_key=self.pastebin_api_key
             )
 
         if self.enable_gist:
             self.gist_thread = start_gist_scanner(
-                self.result_queue, self.db, self.stop_event,
+                self.result_queue, self.stop_event,
                 dashboard=self.dashboard
             )
 
         if self.enable_searchcode:
             self.searchcode_thread = start_searchcode_scanner(
-                self.result_queue, self.db, self.stop_event,
+                self.result_queue, self.stop_event,
                 dashboard=self.dashboard
             )
 
         if self.enable_gitlab:
             self.gitlab_thread = start_gitlab_scanner(
-                self.result_queue, self.db, self.stop_event,
+                self.result_queue, self.stop_event,
                 dashboard=self.dashboard
             )
 
         if self.enable_realtime:
             self.realtime_thread = start_realtime_scanner(
-                self.result_queue, self.db, self.stop_event,
+                self.result_queue, self.stop_event,
                 dashboard=self.dashboard
             )
 
         if self.enable_sourcegraph:
             self.sourcegraph_thread = start_sourcegraph_scanner(
-                self.result_queue, self.db, self.stop_event,
+                self.result_queue, self.stop_event,
                 dashboard=self.dashboard
             )
 
@@ -279,7 +278,7 @@ class SecretScanner:
         try:
             while not self.stop_event.is_set():
                 time.sleep(1)
-                self.dashboard.render()
+                self.dashboard._render()
         except KeyboardInterrupt:
             self.stop()
 
@@ -357,8 +356,8 @@ class SecretScanner:
             self.gist_thread,
             self.searchcode_thread,
             self.gitlab_thread,
-            self.realtime_thread
-            self.git_clone_thread,
+            self.realtime_thread,
+                        self.git_clone_thread,
         ] + self.validator_threads
 
         for thread in threads:

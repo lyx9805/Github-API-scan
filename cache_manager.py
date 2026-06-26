@@ -50,7 +50,7 @@ class CacheConfig:
     cleanup_interval: float = 300.0  # 5分钟
     redis_url: str = field(
         default_factory=lambda: os.getenv('REDIS_URL', '')
-    )分钟
+    )
 
 class DomainHealth(Enum):
     """域名健康状态"""

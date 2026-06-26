@@ -1,14 +1,14 @@
 {
-  "updated_at": "2026-06-23T12:52:46.973501",
-  "total_scanned": 1497,
-  "total_keys_found": 417,
+  "updated_at": "2026-06-26T12:29:25.560394",
+  "total_scanned": 19,
+  "total_keys_found": 94,
   "valid_keys": 0,
-  "invalid_keys": 228,
+  "invalid_keys": 94,
   "quota_exceeded": 0,
   "connection_errors": 0,
-  "skipped_low_entropy": 59,
-  "skipped_blacklist": 10,
-  "skipped_sha": 998012,
-  "skipped_file_filter": 371,
+  "skipped_low_entropy": 1,
+  "skipped_blacklist": 0,
+  "skipped_sha": 158496,
+  "skipped_file_filter": 7,
   "skipped_existing": 0
 }

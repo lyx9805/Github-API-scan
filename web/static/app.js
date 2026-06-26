@@ -10,7 +10,7 @@ const views = ["dashboard", "keys", "config", "logs"];
 function navigateTo(viewName) {
   views.forEach(v => {
     document.getElementById("view-" + v).classList.toggle("active", v === viewName);
-    document.querySelector(.nav-item[data-view=""])?.classList.toggle("active", v === viewName);
+    document.querySelector(`.nav-item[data-view="${v}"]`)?.classList.toggle("active", v === viewName);
   });
 }
 
