@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
 from loguru import logger
+from proxy_pool import get_proxy_pool
 
 from config import (
     config,
@@ -307,10 +308,37 @@ class AsyncValidator:
         if self._session and not self._session.closed:
             await self._session.close()
     
-    def _get_proxy(self) -> Optional[str]:
-        """获取代理 URL"""
+    async def _get_proxy(self) -> Optional[str]:
+        """Get a proxy URL, preferring the shared proxy pool."""
+        proxy_pool = get_proxy_pool()
+        if proxy_pool:
+            proxy_url = await proxy_pool.get_proxy()
+            if proxy_url:
+                return proxy_url
         return config.proxy_url if config.proxy_url else None
-    
+
+    async def _report_proxy_success(self, proxy_url: Optional[str]):
+        if not proxy_url:
+            return
+        proxy_pool = get_proxy_pool()
+        if proxy_pool:
+            await proxy_pool.report_success(proxy_url)
+
+    async def _report_proxy_failure(self, proxy_url: Optional[str]):
+        if not proxy_url:
+            return
+        proxy_pool = get_proxy_pool()
+        if proxy_pool:
+            await proxy_pool.report_failure(proxy_url)
+            if not proxy_pool.has_healthy_proxy and getattr(proxy_pool, "dynamic_source_url", ""):
+                await proxy_pool.refresh_proxy()
+
+    async def _classify_proxy_exception(self, proxy_url: Optional[str], error: Exception):
+        """Mark proxy failures so the pool can rotate and refill dynamically."""
+        if isinstance(error, (asyncio.TimeoutError, aiohttp.ClientConnectorError, aiohttp.ClientProxyConnectionError,
+                              aiohttp.ServerDisconnectedError, aiohttp.ClientOSError, ssl.SSLError)):
+            await self._report_proxy_failure(proxy_url)
+
     def _log(self, message: str, level: str = "INFO"):
         """输出日志"""
         if self.dashboard:
@@ -450,7 +478,7 @@ class AsyncValidator:
         
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         model_tier = "GPT-3.5"
         rpm = 0
@@ -460,6 +488,7 @@ class AsyncValidator:
         for url in self._try_url_variants(base_url, "models"):
             try:
                 async with session.get(url, headers=headers, proxy=proxy) as resp:
+                    await self._report_proxy_success(proxy)
                     # 提取 RPM
                     rpm = int(resp.headers.get('x-ratelimit-limit-requests', 0))
                     
@@ -507,6 +536,7 @@ class AsyncValidator:
                         await self._record_circuit_result(url, http_status=resp.status)
                         
             except asyncio.TimeoutError as e:
+                await self._report_proxy_failure(proxy)
                 await self._record_circuit_result(url, error=e)
                 continue
             except aiohttp.ClientConnectorError as e:
@@ -522,6 +552,7 @@ class AsyncValidator:
         for url in self._try_url_variants(base_url, "chat/completions"):
             try:
                 async with session.post(url, headers=headers, json=chat_body, proxy=proxy) as resp:
+                    await self._report_proxy_success(proxy)
                     if resp.status == 200:
                         await self._record_circuit_result(url, success=True)
                         return ValidationResult(KeyStatus.VALID, "有效(chat)", model_tier, rpm, 0.0, False)
@@ -537,6 +568,7 @@ class AsyncValidator:
                 await self._record_circuit_result(url, error=e)
                 return ValidationResult(KeyStatus.CONNECTION_ERROR, "连接失败")
             except asyncio.TimeoutError as e:
+                await self._report_proxy_failure(proxy)
                 await self._record_circuit_result(url, error=e)
                 continue
             except Exception as e:
@@ -555,10 +587,11 @@ class AsyncValidator:
             return circuit_result
         
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         try:
             async with session.get(url, proxy=proxy) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     await self._record_circuit_result(url, success=True)
                     data = await resp.json()
@@ -577,12 +610,15 @@ class AsyncValidator:
                     await self._record_circuit_result(url, http_status=resp.status)
                     return ValidationResult(KeyStatus.INVALID, f"HTTP {resp.status}")
         except aiohttp.ClientConnectorError as e:
+            await self._report_proxy_failure(proxy)
             await self._record_circuit_result(url, error=e)
             return ValidationResult(KeyStatus.CONNECTION_ERROR, "Gemini连接失败")
         except asyncio.TimeoutError as e:
+            await self._report_proxy_failure(proxy)
             await self._record_circuit_result(url, error=e)
             return ValidationResult(KeyStatus.CONNECTION_ERROR, "Gemini超时")
         except Exception as e:
+            await self._classify_proxy_exception(proxy, e)
             return ValidationResult(KeyStatus.INVALID, str(e)[:20])
     
     async def validate_anthropic(self, api_key: str, base_url: str) -> ValidationResult:
@@ -622,11 +658,12 @@ class AsyncValidator:
         }
         
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         try:
             url = f"{base_url.rstrip('/')}/v1/messages"
             async with session.post(url, headers=headers, json=body, proxy=proxy) as resp:
+                await self._report_proxy_success(proxy)
                 response_text = await resp.text()
                 
                 if resp.status == 200:
@@ -680,12 +717,15 @@ class AsyncValidator:
                     return ValidationResult(KeyStatus.INVALID, f"HTTP {resp.status}")
                     
         except aiohttp.ClientConnectorError as e:
+            await self._report_proxy_failure(proxy)
             await self._record_circuit_result(base_url, error=e)
             return ValidationResult(KeyStatus.CONNECTION_ERROR, "Claude连接失败")
         except asyncio.TimeoutError as e:
+            await self._report_proxy_failure(proxy)
             await self._record_circuit_result(base_url, error=e)
             return ValidationResult(KeyStatus.CONNECTION_ERROR, "Claude超时")
         except Exception as e:
+            await self._classify_proxy_exception(proxy, e)
             return ValidationResult(KeyStatus.INVALID, str(e)[:20])
     
     async def validate_azure(self, api_key: str, base_url: str) -> ValidationResult:
@@ -700,11 +740,12 @@ class AsyncValidator:
         
         headers = {"api-key": api_key, "Content-Type": "application/json"}
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         try:
             url = f"{base_url.rstrip('/')}/openai/deployments?api-version=2023-05-15"
             async with session.get(url, headers=headers, proxy=proxy) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     await self._record_circuit_result(url, success=True)
                     return ValidationResult(KeyStatus.VALID, "Azure有效", "Azure-GPT", 0, 0.0, True)
@@ -718,12 +759,15 @@ class AsyncValidator:
                     await self._record_circuit_result(url, http_status=resp.status)
                     return ValidationResult(KeyStatus.INVALID, f"HTTP {resp.status}")
         except aiohttp.ClientConnectorError as e:
+            await self._report_proxy_failure(proxy)
             await self._record_circuit_result(base_url, error=e)
             return ValidationResult(KeyStatus.CONNECTION_ERROR, "Azure连接失败")
         except asyncio.TimeoutError as e:
+            await self._report_proxy_failure(proxy)
             await self._record_circuit_result(base_url, error=e)
             return ValidationResult(KeyStatus.CONNECTION_ERROR, "Azure超时")
         except Exception as e:
+            await self._classify_proxy_exception(proxy, e)
             return ValidationResult(KeyStatus.INVALID, str(e)[:20])
     
     async def probe_gpt4(self, api_key: str, base_url: str) -> bool:
@@ -735,11 +779,12 @@ class AsyncValidator:
         body = {"model": "gpt-4", "messages": [{"role": "user", "content": "1"}], "max_tokens": 1}
         
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         for url in self._try_url_variants(base_url, "chat/completions"):
             try:
                 async with session.post(url, headers=headers, json=body, proxy=proxy) as resp:
+                    await self._report_proxy_success(proxy)
                     return resp.status == 200
             except Exception as e:
                 logger.debug(f"验证异常: {type(e).__name__}: {e}")
@@ -762,7 +807,7 @@ class AsyncValidator:
         
         headers = {"Authorization": f"Bearer {api_key}"}
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         # ========== 1. OpenAI 官方余额检测 ==========
         if not base_url or "api.openai.com" in base_url:
@@ -809,6 +854,7 @@ class AsyncValidator:
             try:
                 url = f"{base_url.rstrip('/')}{endpoint['path']}"
                 async with session.get(url, headers=headers, proxy=proxy) as resp:
+                    await self._report_proxy_success(proxy)
                     if resp.status == 200:
                         data = await resp.json()
                         balance = self._extract_balance_from_response(data, endpoint['fields'])
@@ -867,7 +913,7 @@ class AsyncValidator:
         
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         session = await self._get_session()
-        proxy = self._get_proxy()
+        proxy = await self._get_proxy()
         
         # 最小化请求：1 token
         chat_body = {
@@ -879,6 +925,7 @@ class AsyncValidator:
         for url in self._try_url_variants(base_url, "chat/completions"):
             try:
                 async with session.post(url, headers=headers, json=chat_body, proxy=proxy) as resp:
+                    await self._report_proxy_success(proxy)
                     response_text = await resp.text()
                     
                     if resp.status == 200:
@@ -932,7 +979,7 @@ class AsyncValidator:
             base_url = "https://api-inference.huggingface.co"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -940,6 +987,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models/gpt2",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "HuggingFace 有效")
                 elif resp.status == 401:
@@ -956,7 +1004,7 @@ class AsyncValidator:
             base_url = "https://api.groq.com/openai/v1"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -964,6 +1012,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Groq 有效")
                 elif resp.status == 401:
@@ -980,7 +1029,7 @@ class AsyncValidator:
             base_url = "https://api.deepseek.com"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -988,6 +1037,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "DeepSeek 有效")
                 elif resp.status == 401:
@@ -1004,7 +1054,7 @@ class AsyncValidator:
             base_url = "https://api.cohere.ai/v1"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1012,6 +1062,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Cohere 有效")
                 elif resp.status == 401:
@@ -1028,7 +1079,7 @@ class AsyncValidator:
             base_url = "https://api.mistral.ai/v1"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1036,6 +1087,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Mistral 有效")
                 elif resp.status == 401:
@@ -1052,7 +1104,7 @@ class AsyncValidator:
             base_url = "https://api.together.xyz/v1"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1060,6 +1112,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Together 有效")
                 elif resp.status == 401:
@@ -1076,7 +1129,7 @@ class AsyncValidator:
             base_url = "https://api.replicate.com/v1"
 
         headers = {"Authorization": f"Token {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1084,6 +1137,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/account",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Replicate 有效")
                 elif resp.status == 401:
@@ -1100,7 +1154,7 @@ class AsyncValidator:
             base_url = "https://api.perplexity.ai"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1108,6 +1162,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Perplexity 有效")
                 elif resp.status == 401:
@@ -1124,7 +1179,7 @@ class AsyncValidator:
             base_url = "https://api.fireworks.ai/inference/v1"
 
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1132,6 +1187,7 @@ class AsyncValidator:
                 f"{base_url.rstrip('/')}/models",
                 headers=headers, proxy=proxy
             ) as resp:
+                await self._report_proxy_success(proxy)
                 if resp.status == 200:
                     return ValidationResult(KeyStatus.VALID, "Fireworks 有效")
                 elif resp.status == 401:
@@ -1145,7 +1201,7 @@ class AsyncValidator:
     async def validate_stripe(self, api_key: str, base_url: str) -> ValidationResult:
         """验证 Stripe API Key"""
         headers = {"Authorization": f"Bearer {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:
@@ -1166,7 +1222,7 @@ class AsyncValidator:
     async def validate_github_token(self, api_key: str, base_url: str) -> ValidationResult:
         """验证 GitHub Token"""
         headers = {"Authorization": f"token {api_key}"}
-        proxy = config.proxy_url or None
+        proxy = await self._get_proxy()
 
         session = await self._get_session()
         try:

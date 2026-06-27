@@ -11,16 +11,14 @@ Sourcegraph 低频补充扫描源
 import re
 import time
 import json
-import queue
 import threading
-import sys
 from typing import List, Optional, Set, Dict
 from urllib.request import Request, urlopen
 from urllib.parse import quote as urlquote
 from urllib.error import URLError
 
 from loguru import logger
-from config import config, REGEX_PATTERNS, score_search_keyword
+from config import config, REGEX_PATTERNS
 from scanner import ScanResult, calculate_entropy, is_test_key, ENTROPY_THRESHOLD
 
 SOURCEGRAPH_STREAM_URL = "https://sourcegraph.com/.api/search/stream"
@@ -28,7 +26,7 @@ REQUEST_TIMEOUT = 30
 MAX_RESULTS_PER_QUERY = 15
 MAX_RAW_FETCH_PER_QUERY = 15
 INTER_KEYWORD_DELAY = 3
-INTER_ROUND_DELAY = 300  # 5 分钟
+INTER_ROUND_DELAY = 300
 
 
 class SourcegraphScanner:
@@ -47,7 +45,6 @@ class SourcegraphScanner:
         self._processed_ids: Set[str] = set()
         self._processed_lock = threading.Lock()
 
-        # 只保留 ENABLED_PROVIDERS 白名单的正则
         self._key_patterns = {
             platform: re.compile(pattern)
             for platform, pattern in REGEX_PATTERNS.items()
@@ -105,9 +102,9 @@ class SourcegraphScanner:
                         except json.JSONDecodeError:
                             pass
         except (URLError, OSError, TimeoutError) as exc:
-            self._log(f"搜索异常: {type(exc).__name__}: {exc}", "ERROR")
+            self._log(f"Search failed: {type(exc).__name__}: {exc}", "ERROR")
         except Exception as exc:
-            self._log(f"未知异常: {type(exc).__name__}: {exc}", "ERROR")
+            self._log(f"Unexpected error: {type(exc).__name__}: {exc}", "ERROR")
 
         return matches
 
@@ -120,7 +117,6 @@ class SourcegraphScanner:
         return f"https://{repo}/blob/HEAD/{path}"
 
     def _build_raw_url(self, match: Dict) -> Optional[str]:
-        """把 Sourcegraph 命中的 GitHub 文件转换为 raw.githubusercontent.com URL。"""
         repo = match.get("repository", "")
         path = match.get("path", "")
         branch = (match.get("branches") or [""])[0] or "HEAD"
@@ -131,7 +127,6 @@ class SourcegraphScanner:
         return f"https://raw.githubusercontent.com/{repo_path}/{urlquote(branch)}/{encoded_path}"
 
     def _fetch_raw_content(self, raw_url: str) -> Optional[str]:
-        """回源下载真实文件内容，绕过 Sourcegraph 对密钥的 *** 打码。"""
         try:
             req = Request(raw_url, headers={
                 "User-Agent": "github-api-scan-sourcegraph/1.0",
@@ -177,14 +172,14 @@ class SourcegraphScanner:
         return results
 
     def _scan_keyword(self, keyword: str) -> int:
-        self._log(f"搜索: {keyword}", "SCAN")
+        self._log(f"Search: {keyword}", "SCAN")
         found = 0
         matches = self._search(keyword)
         if not matches:
-            self._log(f"  无结果", "DEBUG")
+            self._log("  No results", "DEBUG")
             return 0
 
-        self._log(f"  获取到 {len(matches)} 条匹配", "INFO")
+        self._log(f"  Retrieved {len(matches)} matches", "INFO")
         raw_attempts = 0
         raw_hits = 0
         for match in matches:
@@ -198,6 +193,8 @@ class SourcegraphScanner:
 
             self.stats["searched"] += 1
             source_url = self._build_source_url(match)
+            if self.dashboard:
+                self.dashboard.mark_source_activity("sourcegraph", repos_scanned=1, files_scanned=1, target=source_url)
             content = None
             raw_url = self._build_raw_url(match)
             if raw_url and raw_attempts < MAX_RAW_FETCH_PER_QUERY:
@@ -218,13 +215,14 @@ class SourcegraphScanner:
                     if self.dashboard:
                         self.dashboard.increment_stat("total_keys_found")
                         self.dashboard.increment_source_found("sourcegraph")
-                    self._log(f"发现 {kr.platform.upper()}: {kr.api_key[:15]}...", "FOUND")
+                        self.dashboard.mark_source_activity("sourcegraph", keys_found=1)
+                    self._log(f"Found {kr.platform.upper()}: {kr.api_key[:15]}...", "FOUND")
         if raw_attempts:
-            self._log(f"  GitHub raw 回源 {raw_hits}/{raw_attempts} 个文件", "INFO")
+            self._log(f"  GitHub raw fetch {raw_hits}/{raw_attempts} files", "INFO")
         return found
 
     def run(self):
-        self._log("Sourcegraph 补充扫描器启动", "INFO")
+        self._log("Sourcegraph fallback scanner started", "INFO")
         try:
             while not self.stop_event.is_set():
                 try:
@@ -238,22 +236,22 @@ class SourcegraphScanner:
                         time.sleep(INTER_KEYWORD_DELAY)
 
                     if total_found > 0:
-                        self._log(f"本轮发现 {total_found} 个 Key", "INFO")
+                        self._log(f"Round found {total_found} keys", "INFO")
                     else:
-                        self._log(f"本轮无新发现，等待 {INTER_ROUND_DELAY // 60} 分钟", "INFO")
+                        self._log(f"No new keys this round, waiting {INTER_ROUND_DELAY // 60} minutes", "INFO")
 
                     for _ in range(INTER_ROUND_DELAY):
                         if self.stop_event.is_set():
                             break
                         time.sleep(1)
                 except Exception as exc:
-                    self._log(f"轮次异常: {type(exc).__name__}: {exc}", "ERROR")
+                    self._log(f"Round failed: {type(exc).__name__}: {exc}", "ERROR")
                     time.sleep(30)
         except Exception as exc:
-            self._log(f"扫描器致命错误: {type(exc).__name__}: {exc}", "ERROR")
-            logger.exception("[Sourcegraph] 扫描器线程退出")
+            self._log(f"Scanner fatal error: {type(exc).__name__}: {exc}", "ERROR")
+            logger.exception("[Sourcegraph] Scanner thread exited")
         finally:
-            self._log("Sourcegraph 补充扫描器停止", "INFO")
+            self._log("Sourcegraph fallback scanner stopped", "INFO")
 
 
 def start_sourcegraph_scanner(

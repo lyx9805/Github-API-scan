@@ -23,12 +23,10 @@ from config import config, REGEX_PATTERNS
 from scanner import ScanResult, calculate_entropy, is_test_key, ENTROPY_THRESHOLD
 
 
-# GitLab API
 GITLAB_API = "https://gitlab.com/api/v4"
 ASYNC_CONCURRENCY = 20
 ASYNC_TIMEOUT = ClientTimeout(total=20, connect=10)
 
-# 搜索关键词
 GITLAB_KEYWORDS = [
     "OPENAI_API_KEY",
     "sk-proj-",
@@ -107,17 +105,15 @@ class GitLabScanner:
         snippets = []
         try:
             session = await self._get_session()
-            # GitLab public snippets API 要求认证，改用 explore 页面抓取
             url = "https://gitlab.com/explore/snippets"
             proxy = config.proxy_url if config.proxy_url else None
 
             async with session.get(url, proxy=proxy) as resp:
                 if resp.status != 200:
-                    self._log(f"explore/snippets 返回 {resp.status}", "ERROR")
+                    self._log(f"explore/snippets returned {resp.status}", "ERROR")
                     return []
 
                 html = await resp.text()
-                # 解析 snippet 链接: /<user>/<project>/-/snippets/<id>
                 import re as _re
                 pattern = _re.compile(r'href="(/[^"]+/snippets/(\d+))"')
                 seen = set()
@@ -136,7 +132,7 @@ class GitLabScanner:
                         raw_url=raw_url
                     ))
         except Exception as e:
-            self._log(f"搜索异常: {type(e).__name__}: {e}", "ERROR")
+            self._log(f"Search failed: {type(e).__name__}: {e}", "ERROR")
 
         return snippets
 
@@ -198,6 +194,14 @@ class GitLabScanner:
             return 0
 
         self.stats["snippets_scanned"] += 1
+        if self.dashboard:
+            self.dashboard.mark_source_activity(
+                "gitlab",
+                source_type="public_snippet",
+                target=snippet.web_url,
+                candidates_discovered=1,
+                files_scanned=1,
+            )
         results = self._extract_keys(content, snippet.web_url)
 
         found = 0
@@ -208,7 +212,8 @@ class GitLabScanner:
                 if self.dashboard:
                     self.dashboard.increment_stat("total_keys_found")
                     self.dashboard.increment_source_found("gitlab")
-                self._log(f"发现 {result.platform.upper()}: {result.api_key[:15]}...", "FOUND")
+                    self.dashboard.mark_source_activity("gitlab", keys_found=1)
+                self._log(f"Found {result.platform.upper()}: {result.api_key[:15]}...", "FOUND")
 
         return found
 
@@ -226,7 +231,7 @@ class GitLabScanner:
 
     def run(self):
         """运行扫描器"""
-        self._log("GitLab 扫描器启动", "INFO")
+        self._log("GitLab scanner started", "INFO")
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -235,18 +240,18 @@ class GitLabScanner:
             while not self.stop_event.is_set():
                 total_found = 0
 
-                self._log("获取公开 Snippets...", "SCAN")
+                self._log("Fetching public snippets...", "SCAN")
                 snippets = loop.run_until_complete(self._search_snippets(""))
 
                 if snippets:
-                    self._log(f"找到 {len(snippets)} 个 Snippets", "INFO")
+                    self._log(f"Found {len(snippets)} snippets", "INFO")
                     found = loop.run_until_complete(self._scan_batch(snippets))
                     total_found += found
 
                 if total_found > 0:
-                    self._log(f"本轮发现 {total_found} 个 Key", "INFO")
+                    self._log(f"Round found {total_found} keys", "INFO")
 
-                self._log("等待 5 分钟...", "INFO")
+                self._log("Waiting 5 minutes before next round...", "INFO")
                 for _ in range(300):
                     if self.stop_event.is_set():
                         break
@@ -256,7 +261,7 @@ class GitLabScanner:
             loop.run_until_complete(self._close_session())
             loop.close()
 
-        self._log("GitLab 扫描器停止", "INFO")
+        self._log("GitLab scanner stopped", "INFO")
 
 
 def start_gitlab_scanner(

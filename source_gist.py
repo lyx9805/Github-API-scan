@@ -72,29 +72,24 @@ class GistScanner:
         self.stop_event = stop_event
         self.dashboard = dashboard
 
-        # GitHub 客户端
         self._github_clients: List[Github] = []
         self._current_client_index = 0
         self._init_github_clients()
 
-        # 已处理的 Gist ID
         self._processed_gists: Set[str] = set()
         self._processed_lock = threading.Lock()
 
-        # 编译正则
         self._key_patterns = {
             platform: re.compile(pattern)
             for platform, pattern in REGEX_PATTERNS.items()
             if platform != "azure"
         }
 
-        # 统计
         self.stats = {
             "gists_scanned": 0,
             "keys_found": 0,
         }
 
-        # aiohttp session
         self._session: Optional[aiohttp.ClientSession] = None
 
     def _log(self, message: str, level: str = "INFO"):
@@ -173,11 +168,9 @@ class GistScanner:
             for match in pattern.finditer(content):
                 api_key = match.group(0)
 
-                # 测试 Key 检测
                 if is_test_key(api_key):
                     continue
 
-                # 熵值过滤
                 key_body = api_key
                 prefixes = ['sk-proj-', 'sk-ant-', 'sk-', 'AIza', 'hf_', 'gsk_']
                 for prefix in prefixes:
@@ -188,7 +181,6 @@ class GistScanner:
                 if calculate_entropy(key_body) < ENTROPY_THRESHOLD:
                     continue
 
-                # 提取上下文
                 start = max(0, match.start() - 200)
                 end = min(len(content), match.end() + 200)
                 context = content[start:end]
@@ -209,28 +201,21 @@ class GistScanner:
 
         try:
             client = self._get_client()
-
-            # 使用 GitHub Gist API 获取公开 Gist
-            # 注意: GitHub 不支持直接搜索 Gist 内容，只能获取最近的公开 Gist
-            # 然后在本地过滤
             public_gists = client.get_gists()
 
             for i, gist in enumerate(public_gists):
                 if self.stop_event.is_set():
                     break
-                if i >= 100:  # 每轮最多处理 100 个 Gist
+                if i >= 100:
                     break
 
                 try:
                     gist_id = gist.id
-
-                    # 检查是否已处理
                     with self._processed_lock:
                         if gist_id in self._processed_gists:
                             continue
                         self._processed_gists.add(gist_id)
 
-                    # 遍历 Gist 中的文件
                     for filename, file_info in gist.files.items():
                         raw_url = file_info.raw_url
                         if raw_url:
@@ -246,13 +231,13 @@ class GistScanner:
 
         except GithubException as e:
             if "rate limit" in str(e).lower():
-                self._log("GitHub API 速率限制，等待...", "WARN")
+                self._log("GitHub API rate limited, waiting...", "WARN")
                 self._rotate_client()
                 time.sleep(60)
             else:
-                self._log(f"GitHub API 错误: {str(e)[:50]}", "ERROR")
+                self._log(f"GitHub API error: {str(e)[:50]}", "ERROR")
         except Exception as e:
-            self._log(f"搜索异常: {type(e).__name__}", "ERROR")
+            self._log(f"Search failed: {type(e).__name__}", "ERROR")
 
         return gist_files
 
@@ -263,6 +248,14 @@ class GistScanner:
             return 0
 
         self.stats["gists_scanned"] += 1
+        if self.dashboard:
+            self.dashboard.mark_source_activity(
+                "gist",
+                source_type="public_gist",
+                target=gist_file.html_url,
+                candidates_discovered=1,
+                files_scanned=1,
+            )
 
         results = self._extract_keys(content, gist_file.html_url)
 
@@ -272,7 +265,8 @@ class GistScanner:
                 if self.dashboard:
                     self.dashboard.increment_stat("total_keys_found")
                     self.dashboard.increment_source_found("gist")
-                self._log(f"发现 {result.platform.upper()} Key: {result.api_key[:12]}...", "FOUND")
+                    self.dashboard.mark_source_activity("gist", keys_found=1)
+                self._log(f"Found {result.platform.upper()} key: {result.api_key[:12]}...", "FOUND")
 
         return len(results)
 
@@ -286,12 +280,11 @@ class GistScanner:
 
         tasks = [scan_one(gf) for gf in gist_files]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-
         return sum(r for r in results if isinstance(r, int))
 
     def run(self):
         """运行扫描器主循环"""
-        self._log("Gist 扫描器启动", "INFO")
+        self._log("Gist scanner started", "INFO")
 
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -300,23 +293,20 @@ class GistScanner:
             while not self.stop_event.is_set():
                 total_found = 0
 
-                self._log("获取公开 Gist...", "SCAN")
-
-                # 获取公开 Gist（不再按关键词搜索）
+                self._log("Fetching public gists...", "SCAN")
                 gist_files = self._search_gists("")
 
                 if gist_files:
-                    self._log(f"找到 {len(gist_files)} 个 Gist 文件", "INFO")
+                    self._log(f"Found {len(gist_files)} gist files", "INFO")
                     found = loop.run_until_complete(self._scan_batch(gist_files))
                     total_found += found
 
                 self._rotate_client()
 
                 if total_found > 0:
-                    self._log(f"本轮共发现 {total_found} 个 Key", "INFO")
+                    self._log(f"Round found {total_found} keys", "INFO")
 
-                # 等待下一轮
-                self._log("等待 3 分钟后开始下一轮...", "INFO")
+                self._log("Waiting 3 minutes before next round...", "INFO")
                 for _ in range(180):
                     if self.stop_event.is_set():
                         break
@@ -326,7 +316,7 @@ class GistScanner:
             loop.run_until_complete(self._close_session())
             loop.close()
 
-        self._log("Gist 扫描器停止", "INFO")
+        self._log("Gist scanner stopped", "INFO")
 
 
 def start_gist_scanner(

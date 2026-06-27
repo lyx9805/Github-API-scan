@@ -1,9 +1,9 @@
-# GitHub Secret Scanner Pro - Docker Compose 配置
-# 使用方法:
-#   1. 复制 .env.example 为 .env 并填入配置
-#   2. docker compose up -d (后台启动)
-#   3. docker attach github-scanner (连接 TUI 界面, Ctrl+p Ctrl+q 退出)
-#   4. docker compose logs -f (查看日志)
+# GitHub Secret Scanner Pro - Docker Compose 閰嶇疆
+# 浣跨敤鏂规硶:
+#   1. 澶嶅埗 .env.example 涓?.env 骞跺～鍏ラ厤缃?
+#   2. docker compose up -d (鍚庡彴鍚姩)
+#   3. docker attach github-scanner (杩炴帴 TUI 鐣岄潰, Ctrl+p Ctrl+q 閫€鍑?
+#   4. docker compose logs -f (鏌ョ湅鏃ュ織)
 
 services:
   scanner:
@@ -13,11 +13,11 @@ services:
     container_name: github-scanner
     restart: unless-stopped
 
-    # 交互式 TUI 需要
+    # 浜や簰寮?TUI 闇€瑕?
     stdin_open: true
     tty: true
 
-    # 环境变量（从 .env 文件读取）
+    # 鐜鍙橀噺锛堜粠 .env 鏂囦欢璇诲彇锛?
     environment:
       - GITHUB_TOKENS=${GITHUB_TOKENS:-}
       - PROXY_URL=${PROXY_URL:-}
@@ -25,8 +25,9 @@ services:
       - SCANNER_LOG_PATH=/app/output/scanner.log
       - RUNTIME_STATE_PATH=/app/output/runtime_state.json
       - CUMULATIVE_STATS_PATH=/app/output/cumulative_stats.json
+      - CONFIG_PATH=/app/output/config_local.py
       - MAX_SEARCH_RESULTS_PER_KEYWORD=${MAX_SEARCH_RESULTS_PER_KEYWORD:-100}
-      - ENABLED_PROVIDERS=${ENABLED_PROVIDERS:-openai,relay,oneapi,newapi}
+      - ENABLED_PROVIDERS=${ENABLED_PROVIDERS:-openai,deepseek,glm,minimax,kimi}
       - ENABLE_ALL_SOURCES=${ENABLE_ALL_SOURCES:-false}
       - ENABLE_GIST=${ENABLE_GIST:-true}
       - ENABLE_GITLAB=${ENABLE_GITLAB:-true}
@@ -34,13 +35,15 @@ services:
       - ENABLE_SEARCHCODE=${ENABLE_SEARCHCODE:-false}
       - ENABLE_REALTIME=${ENABLE_REALTIME:-false}
       - ENABLE_SOURCEGRAPH=${ENABLE_SOURCEGRAPH:-true}
+      - ENABLE_GIT_CLONE=${ENABLE_GIT_CLONE:-false}
+      - GIT_CLONE_DIR=${GIT_CLONE_DIR:-/app/output/git_clone_cache}
 
-    # 数据持久化
+    # 鏁版嵁鎸佷箙鍖?
     volumes:
       - scanner-data:/app/data
       - ./output:/app/output
 
-    # 资源限制
+    # 璧勬簮闄愬埗
     deploy:
       resources:
         limits:
@@ -67,11 +70,12 @@ services:
       - GITHUB_TOKENS=${GITHUB_TOKENS:-}
       - SCANNER_LOG_PATH=/app/output/scanner.log
       - RUNTIME_STATE_PATH=/app/output/runtime_state.json
+      - CONFIG_PATH=/app/output/config_local.py
     ports:
       - "18080:8080"
     volumes:
       - scanner-data:/app/data:ro
-      - ./output:/app/output:ro
+      - ./output:/app/output
     depends_on:
       - scanner
     networks:

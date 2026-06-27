@@ -82,47 +82,47 @@
 
       <!-- Summary Cards -->
       <div class="cards-grid" id="summaryCards">
-        <div class="stat-card"><div class="stat-label">Valid Keys</div><div class="stat-value good" id="statValid">--</div></div>
-        <div class="stat-card"><div class="stat-label">Total Found</div><div class="stat-value" id="statTotal">--</div></div>
-        <div class="stat-card"><div class="stat-label">Scanned Files</div><div class="stat-value" id="statScanned">--</div></div>
+        <div class="stat-card"><div class="stat-label">Valid</div><div class="stat-value good" id="statValid">--</div></div>
+        <div class="stat-card"><div class="stat-label">Discovered</div><div class="stat-value" id="statTotal">--</div></div>
+        <div class="stat-card"><div class="stat-label">Files</div><div class="stat-value" id="statScanned">--</div></div>
         <div class="stat-card"><div class="stat-label">High Value</div><div class="stat-value accent" id="statHighValue">--</div></div>
-        <div class="stat-card"><div class="stat-label">Scanning</div><div class="stat-value" id="statStatus">--</div></div>
+        <div class="stat-card"><div class="stat-label">Run State</div><div class="stat-value" id="statStatus">--</div></div>
         <div class="stat-card"><div class="stat-label">Queue</div><div class="stat-value" id="statQueue">--</div></div>
       </div>
 
       <!-- Charts Row -->
       <div class="charts-grid">
         <div class="card">
-          <div class="card-title">Status Distribution</div>
+          <div class="card-title">Current Run</div>
           <div id="statusChart" class="chart-list"></div>
         </div>
         <div class="card">
-          <div class="card-title">Platform Distribution</div>
+          <div class="card-title">Source Efficiency</div>
           <div id="platformChart" class="chart-list"></div>
         </div>
       </div>
 
       <!-- Daily Trend -->
       <div class="card">
-        <div class="card-title">Last 14 Days</div>
+        <div class="card-title">Progress Feed</div>
         <div id="dailyChart" class="bar-chart"></div>
       </div>
 
       <!-- Token Quota -->
       <div class="card">
-        <div class="card-title">GitHub Token Quota</div>
+        <div class="card-title">Quota Status</div>
         <div id="quotaStatus" class="quota-grid"></div>
       </div>
 
-      <!-- Proxy Pool -->
+      <!-- Proxy Health -->
       <div class="card">
-        <div class="card-title">Proxy Pool</div>
+        <div class="card-title">Proxy Health</div>
         <div id="proxyPoolStatus" class="quota-grid"></div>
       </div>
 
-      <!-- Query Quality -->
+      <!-- Quality & Breakdown -->
       <div class="card">
-        <div class="card-title">Query Quality</div>
+        <div class="card-title">Quality & Breakdown</div>
         <div id="queryQuality" class="chart-list"></div>
       </div>
     </div>
@@ -193,8 +193,21 @@
             <span class="form-hint">Leave empty for direct connection</span>
           </div>
           <div class="form-group">
+            <label>Dynamic Proxy Source URL</label>
+            <input id="cfgDynamicProxySourceUrl" placeholder="https://example.com/api/proxy" class="input-mono" />
+            <span class="form-hint">The panel stores this source URL and fetches one proxy at a time when needed.</span>
+          </div>
+          <div class="form-group">
             <label>Env PROXY_URL</label>
             <input id="cfgEnvProxyUrl" readonly disabled placeholder="--" class="input-mono" />
+          </div>
+          <div class="form-group">
+            <label>Env DYNAMIC_PROXY_SOURCE_URL</label>
+            <input id="cfgEnvDynamicProxySourceUrl" readonly disabled placeholder="--" class="input-mono" />
+          </div>
+          <div class="form-group">
+            <button id="fetchProxyBtn" class="btn-ghost-sm" type="button">Fetch Proxy Now</button>
+            <span id="fetchProxyResult" class="form-hint"></span>
           </div>
         </div>
 
@@ -207,12 +220,12 @@
           </div>
           <div class="form-group">
             <label>Enabled Providers</label>
-            <input id="cfgProviders" placeholder="openai, relay, oneapi" class="input-mono" />
+            <input id="cfgProviders" placeholder="openai, deepseek, glm, minimax, kimi" class="input-mono" />
           </div>
         </div>
 
         <div class="card config-section">
-          <div class="card-title">Scanning</div>
+          <div class="card-title">Run State</div>
           <div class="form-group">
             <label>Search Keywords <span class="muted">(comma separated)</span></label>
             <textarea id="cfgKeywords" rows="4" placeholder="OPENAI_API_KEY, sk-proj-, AIzaSy..." class="input-mono"></textarea>
@@ -273,6 +286,7 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=2"></script>
+<script src="/static/app.js?v=3"></script>
 </body>
 </html>
+

@@ -392,7 +392,7 @@ class GitHubScanner:
         self._github_clients: List[Github] = []
         self._current_client_index = 0
         self._client_lock = threading.Lock()
-        self._max_results_per_keyword = int(os.getenv("MAX_SEARCH_RESULTS_PER_KEYWORD", "1000"))
+        self._max_results_per_keyword = int(os.getenv("MAX_SEARCH_RESULTS_PER_KEYWORD", "100"))
         self._token_quota = {}
         self._request_backoff_until = 0.0
         self._request_backoff_seconds = 0.0
@@ -441,8 +441,9 @@ class GitHubScanner:
     
     def _init_github_clients(self):
         """初始化 GitHub 客户端池"""
-        if getattr(config, "proxy_urls", None):
-            init_proxy_pool(config.proxy_urls)
+        dynamic_source_url = getattr(config, "dynamic_proxy_source_url", "")
+        if getattr(config, "proxy_urls", None) or dynamic_source_url:
+            init_proxy_pool(config.proxy_urls, dynamic_source_url)
             os.environ.pop('HTTP_PROXY', None)
             os.environ.pop('HTTPS_PROXY', None)
         elif config.proxy_url:
@@ -552,7 +553,7 @@ class GitHubScanner:
     def _apply_request_backoff(self, base_seconds: float, reason: str):
         self._request_backoff_seconds = min(120.0, max(base_seconds, self._request_backoff_seconds * 1.8 if self._request_backoff_seconds else base_seconds))
         self._request_backoff_until = time.time() + self._request_backoff_seconds
-        self._log(f"请求退避 {self._request_backoff_seconds:.0f}s ({reason})", "WARN")
+        self._log(f"Request backoff {self._request_backoff_seconds:.0f}s ({reason})", "WARN")
 
     def _wait_for_request_backoff(self):
         while self._request_backoff_until > time.time() and not self.stop_event.is_set():
@@ -610,7 +611,7 @@ class GitHubScanner:
             return True
         if best_wait_until:
             wait = max(0, best_wait_until - now_ts)
-            self._log(f"所有 Token 的 Code Search 配额暂时不可用，约 {wait:.0f}s 后恢复", "WARN")
+            self._log(f"All tokens are temporarily unavailable for Code Search, retry in about {wait:.0f}s", "WARN")
         return False
 
     def _preload_scanned_shas(self):
@@ -1041,7 +1042,7 @@ class GitHubScanner:
                     self.stats["skipped_entropy"] += 1
                     if self.dashboard:
                         self.dashboard.increment_stat("skipped_low_entropy")
-                    self._log(f"跳过 {mask_key(api_key)} ({reason})", "SKIP")
+                    self._log(f"Skip {mask_key(api_key)} ({reason})", "SKIP")
                     continue
                 
                 # 提取上下文
@@ -1066,7 +1067,7 @@ class GitHubScanner:
                     self.stats["skipped_blacklist"] += 1
                     if self.dashboard:
                         self.dashboard.increment_stat("skipped_blacklist")
-                    self._log(f"跳过 {mask_key(api_key)} (URL: {url_reason})", "SKIP")
+                    self._log(f"Skip {mask_key(api_key)} (URL: {url_reason})", "SKIP")
                     continue
                 
                 results.append(ScanResult(
@@ -1102,34 +1103,38 @@ class GitHubScanner:
             if entry.get("disabled_until", 0) > time.time()
         ]
         sleep_seconds = max(5, min(waits) if waits else 30)
-        self._log(f"全部 Token Code Search 配额耗尽，等待 {sleep_seconds:.0f}s...", "WARN")
+        self._log(f"All token Code Search quota exhausted, waiting {sleep_seconds:.0f}s...", "WARN")
         while sleep_seconds > 0 and not self.stop_event.is_set():
             time.sleep(min(10, sleep_seconds))
             sleep_seconds -= 10
         return True
 
     def search_keyword(self, keyword: str) -> int:
-        """
-        搜索单个关键词
-        
-        优化：使用 aiohttp 异步批量下载文件内容，大幅提升速度
-        """
+        """Search a single code-search keyword and process matching files in batches."""
         found_count = 0
         current_index = self._current_client_index % len(self._github_clients) if self._github_clients else 0
-        
+        score, source_type, _reasons = score_search_keyword(keyword)
+
         if self.dashboard:
             self.dashboard.update_stats(
                 current_keyword=keyword,
                 current_token_index=self._current_client_index,
-                total_tokens=len(self._github_clients)
+                total_tokens=len(self._github_clients),
             )
-        
+            self.dashboard.mark_source_activity(
+                "code_search",
+                source_type=source_type,
+                source_score=float(score),
+                target=keyword,
+                keyword=keyword,
+                budget_total=getattr(self, "_keyword_budget", 0),
+            )
+
         try:
             self._wait_for_request_backoff()
-            self._log(f"搜索 \"{keyword}\"...", "SCAN")
-            
-            # GitHub Dorks 语法不需要额外的 in:file
-            query = keyword if any(x in keyword for x in ['filename:', 'path:', 'language:']) else f"{keyword} in:file"
+            self._log(f'Searching "{keyword}"...', "SCAN")
+
+            query = keyword if any(marker in keyword for marker in ["filename:", "path:", "language:"]) else f"{keyword} in:file"
             if not self._select_available_client():
                 self._handle_rate_limit()
                 return found_count
@@ -1140,237 +1145,212 @@ class GitHubScanner:
             self._record_token_success(current_index)
             self._relax_request_backoff()
 
-            # ========== 优化：批量收集文件元数据 + 多层过滤 ==========
-            # 批量大小从 50 降至 40，减少长尾阻塞
             batch_size = 40
             files_batch = []
-            
+
             for i, code_file in enumerate(code_results):
                 if i >= self._max_results_per_keyword:
-                    self._log(f"关键词结果达到上限 {self._max_results_per_keyword}，切换下一个关键词", "INFO")
+                    self._log(f'Result cap reached for keyword: {self._max_results_per_keyword}', "INFO")
                     break
                 if self.stop_event.is_set():
                     break
-                
+
                 try:
-                    # ===== 1. SHA 去重 - 最先检查，跳过已扫描文件 =====
-                    file_sha = getattr(code_file, 'sha', None)
+                    file_sha = getattr(code_file, "sha", None)
                     if file_sha and self._is_sha_processed(file_sha):
                         self.stats["skipped_sha"] += 1
                         if self.dashboard:
                             self.dashboard.increment_stat("skipped_sha")
+                            self.dashboard.mark_source_activity("code_search", skipped={"skipped_sha": 1})
                         continue
-                    
-                    # ===== 2. 文件路径/大小过滤 =====
-                    file_path = getattr(code_file, 'path', '') or ''
-                    file_size = getattr(code_file, 'size', 0) or 0
-                    
-                    skip_file, skip_reason = should_skip_file(file_path, file_size)
+
+                    file_path = getattr(code_file, "path", "") or ""
+                    file_size = getattr(code_file, "size", 0) or 0
+                    skip_file, _skip_reason = should_skip_file(file_path, file_size)
                     if skip_file:
                         self.stats["skipped_file_filter"] += 1
                         if self.dashboard:
                             self.dashboard.increment_stat("skipped_file_filter")
+                            self.dashboard.mark_source_activity("code_search", skipped={"skipped_file_filter": 1})
                         if file_sha:
-                            self._mark_sha_processed(file_sha)  # 标记为已处理，下次不再检查
+                            self._mark_sha_processed(file_sha)
                         continue
-                    
-                    # ===== 3. 获取下载 URL =====
+
                     raw_url = code_file.download_url
                     html_url = code_file.html_url
-                    
-                    # 标记 SHA 为已处理
                     if file_sha:
                         self._mark_sha_processed(file_sha)
-                    
+
                     if raw_url:
                         files_batch.append((raw_url, html_url, code_file))
                     else:
-                        # 无 raw_url，回退到 PyGitHub API
                         try:
-                            content = code_file.decoded_content.decode('utf-8', errors='ignore')
+                            content = code_file.decoded_content.decode("utf-8", errors="ignore")
                             found_count += self._process_downloaded_file(html_url, content, found_count)
                         except Exception:
-                            logger.debug("异常: decoded_content_fallback_failed")
-                    
-                    # 达到批量大小，执行异步下载
+                            logger.debug("decoded_content_fallback_failed")
+
                     if len(files_batch) >= batch_size:
                         found_count += self._process_file_batch(files_batch)
                         files_batch = []
                         self._rotate_client()
                         if self.dashboard:
                             self.dashboard.update_stats(current_token_index=self._current_client_index)
-                    
-                except Exception as e:
-                    logger.debug(f"扫描异常: {type(e).__name__}: {e}")
+
+                except Exception as exc:
+                    logger.debug(f"scan_item_error: {type(exc).__name__}: {exc}")
                     continue
-            
-            # 处理剩余的文件
+
             if files_batch:
                 found_count += self._process_file_batch(files_batch)
-            
+
         except RateLimitExceededException:
-            self._log("速率限制，切换 Token...", "WARN")
+            self._log("Rate limit hit, rotating token...", "WARN")
             self._handle_rate_limit()
-        except GithubException as e:
-            error_text = str(e).lower()
+        except GithubException as exc:
+            error_text = str(exc).lower()
             is_rate_limited = (
                 "rate limit" in error_text
                 or "api rate limit exceeded" in error_text
-                or getattr(e, "status", None) == 403
+                or getattr(exc, "status", None) == 403
             )
             if is_rate_limited:
-                self._log("Code Search 配额耗尽，进入等待/切换 Token", "WARN")
+                self._log("Code Search quota exhausted, waiting for next token/reset", "WARN")
                 self._handle_rate_limit()
             else:
-                self._record_token_failure(current_index, reason=f"github:{getattr(e, 'status', 'error')}", cooldown=20.0)
+                self._record_token_failure(current_index, reason=f"github:{getattr(exc, 'status', 'error')}", cooldown=20.0)
                 self._apply_request_backoff(8.0, "github_error")
-                self._log(f"API 错误: {str(e)[:60]}", "ERROR")
+                self._log(f"API error: {str(exc)[:60]}", "ERROR")
                 self._rotate_client()
-        except Exception as e:
-            self._record_token_failure(current_index, reason=type(e).__name__, cooldown=10.0)
-            self._apply_request_backoff(5.0, type(e).__name__)
-            self._log(f"搜索错误: {str(e)[:30]}", "ERROR")
+        except Exception as exc:
+            self._record_token_failure(current_index, reason=type(exc).__name__, cooldown=10.0)
+            self._apply_request_backoff(5.0, type(exc).__name__)
+            self._log(f"Search error: {str(exc)[:60]}", "ERROR")
             self._rotate_client()
-        
+
         return found_count
 
     def _process_file_batch(self, files_batch: List[Tuple[str, str, any]]) -> int:
-        """
-        异步批量处理文件
-        
-        Args:
-            files_batch: [(raw_url, html_url, code_file), ...]
-            
-        Returns:
-            发现的 Key 数量
-        """
+        """Download and process a batch of candidate files."""
         found_count = 0
-        
-        # 异步批量下载
         downloaded_files = self._run_async_download(files_batch)
-        
-        # 处理下载的文件
+
         for html_url, content, code_file in downloaded_files:
             found_count += self._process_downloaded_file(html_url, content, found_count)
-        
-        # 对于下载失败的文件，回退到 PyGitHub API
+
         downloaded_urls = {item[0] for item in downloaded_files}
         for raw_url, html_url, code_file in files_batch:
             if html_url not in downloaded_urls:
                 try:
-                    content = code_file.decoded_content.decode('utf-8', errors='ignore')
+                    content = code_file.decoded_content.decode("utf-8", errors="ignore")
                     found_count += self._process_downloaded_file(html_url, content, found_count)
-                except Exception as e:
-                    logger.debug(f"异常: {type(e).__name__}")
-        
+                except Exception as exc:
+                    logger.debug(f"fallback_decode_error: {type(exc).__name__}")
+
         return found_count
-    
+
     def _process_downloaded_file(self, source_url: str, content: str, current_count: int) -> int:
-        """
-        处理单个下载的文件
-        
-        Args:
-            source_url: 文件来源 URL
-            content: 文件内容
-            current_count: 当前计数
-            
-        Returns:
-            发现的 Key 数量
-        """
+        """Extract candidate keys from one downloaded file."""
         found_count = 0
-        
         self.stats["files_scanned"] += 1
         if self.dashboard:
             self.dashboard.increment_stat("total_scanned")
-        
-        # 提取 Key
+            self.dashboard.mark_source_activity("code_search", files_scanned=1)
+
         results = self._extract_keys_from_content(content, source_url)
-        
+
         for result in results:
             try:
                 self.result_queue.put(result, timeout=5)
-            except Exception as e:
-                logger.debug(f"异常: {type(e).__name__}")  # 队列满时跳过
+            except Exception as exc:
+                logger.debug(f"result_queue_error: {type(exc).__name__}")
             found_count += 1
             self.stats["total_found"] += 1
-            
+
             if self.dashboard:
                 self.dashboard.increment_stat("total_keys_found")
-                self.dashboard.increment_source_found("github")
+                self.dashboard.increment_source_found("code_search")
+                self.dashboard.mark_source_activity("code_search", keys_found=1)
                 self.dashboard.add_log(
-                    f"发现 {result.platform.upper()} Key: {mask_key(result.api_key)}",
-                    "FOUND"
+                    f"Found {result.platform.upper()} key: {mask_key(result.api_key)}",
+                    "FOUND",
                 )
-        
+
         return found_count
-    
+
     def run(self, resume: bool = False):
-        """
-        运行扫描器主循环
-        
-        Args:
-            resume: 是否从断点续传
-        """
+        """Run the scanner main loop with a bounded keyword budget."""
         round_num = 0
         keywords = config.get_scheduled_search_keywords()
         total_keywords = len(keywords)
+        keyword_budget = min(total_keywords, int(os.getenv("CODE_SEARCH_KEYWORD_BUDGET", "8"))) if total_keywords else 0
+        self._keyword_budget = keyword_budget
 
         if self.dashboard and keywords:
-            top_keywords = keywords[:5]
-            self._log(
-                "优先级最高的关键词: " + " | ".join(top_keywords),
-                "INFO"
-            )
+            top_keywords = keywords[: min(keyword_budget or 5, 5)]
+            self._log("Top priority keywords: " + " | ".join(top_keywords), "INFO")
 
-        # 断点续传：加载上次进度
         start_index = 0
-        if resume:
+        if resume and keyword_budget:
             progress = self.db.load_progress()
-            if progress["total"] == total_keywords and not progress["is_completed"]:
+            if progress["total"] == keyword_budget and not progress["is_completed"]:
                 start_index = progress["current_index"]
-                self._log(f"从断点恢复: 关键词 {start_index + 1}/{total_keywords}", "INFO")
+                self._log(f"Resuming from keyword {start_index + 1}/{keyword_budget}", "INFO")
             else:
-                self._log("未找到有效的断点，从头开始扫描", "INFO")
+                self._log("No matching resume checkpoint found, starting from the beginning", "INFO")
 
         while not self.stop_event.is_set():
             round_num += 1
             scan_run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-r{round_num}"
             if self.dashboard and hasattr(self.dashboard, "start_scan_run"):
-                self.dashboard.start_scan_run(scan_run_id, round_num, total_keywords)
-            self._log(f"SCAN_RUN_START {scan_run_id} 第 {round_num} 轮，共 {total_keywords} 个关键词", "SCAN")
+                self.dashboard.start_scan_run(scan_run_id, round_num, keyword_budget)
+                self.dashboard.update_stats(search_budget_total=keyword_budget, search_budget_used=0)
+            self._log(f"SCAN_RUN_START {scan_run_id} round {round_num}, keywords {keyword_budget}/{total_keywords}", "SCAN")
 
-            for i, keyword in enumerate(keywords):
+            if keyword_budget == 0:
+                self._log("No scheduled code-search keywords available", "WARN")
+                time.sleep(30)
+                continue
+
+            for i, keyword in enumerate(keywords[:keyword_budget]):
                 if self.stop_event.is_set():
                     break
-
-                # 断点续传：跳过已完成的关键词（仅第一轮）
                 if round_num == 1 and i < start_index:
                     continue
 
+                score, source_type, _reasons = score_search_keyword(keyword)
                 if self.dashboard:
-                    self.dashboard.update_stats(round_keyword_index=i + 1, round_total_keywords=total_keywords)
+                    self.dashboard.update_stats(
+                        round_keyword_index=i + 1,
+                        round_total_keywords=keyword_budget,
+                        search_budget_used=i + 1,
+                    )
+                    self.dashboard.mark_source_activity(
+                        "code_search",
+                        source_type=source_type,
+                        source_score=float(score),
+                        target=keyword,
+                        keyword=keyword,
+                        budget_total=keyword_budget,
+                    )
+
                 found_count = self.search_keyword(keyword)
-                if self.dashboard and hasattr(self.dashboard, '_record_query_quality'):
+                if self.dashboard and hasattr(self.dashboard, "_record_query_quality"):
                     self.dashboard._record_query_quality(keyword, scanned=1, found=found_count, valid=0)
 
-                # 保存进度
-                self.db.save_progress(i + 1, total_keywords, is_completed=(i + 1 == total_keywords))
+                self.db.save_progress(i + 1, keyword_budget, is_completed=(i + 1 == keyword_budget))
 
                 if not self.stop_event.is_set():
                     time.sleep(0.5)
 
-            # 本轮完成，标记进度
-            self.db.save_progress(total_keywords, total_keywords, is_completed=True)
+            self.db.save_progress(keyword_budget, keyword_budget, is_completed=True)
 
-            # 等待下一轮
             if not self.stop_event.is_set():
-                self._log(f"第 {round_num} 轮完成，等待 2 分钟...", "INFO")
+                self._log(f"Round {round_num} complete, waiting 2 minutes...", "INFO")
                 for _ in range(12):
                     if self.stop_event.is_set():
                         break
                     time.sleep(10)
-
-                # 新一轮重置进度
                 self.db.reset_progress()
 
 

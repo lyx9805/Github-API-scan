@@ -9,6 +9,7 @@
 """
 
 import os
+import importlib.util
 import random
 from functools import lru_cache
 from dataclasses import dataclass, field
@@ -97,6 +98,15 @@ REGEX_PATTERNS = {
 
     # DeepSeek: sk- 开头，48+ 字符 (与 OpenAI 区分靠长度)
     "deepseek": r'sk-[a-zA-Z0-9]{48,}',
+
+    # Zhipu GLM / BigModel: 常见为 32 位 id + 16 位 secret 的复合 key
+    "glm": r'(?<![A-Za-z0-9])(?!(?:0{32}\\.[A-Za-z0-9]{16}|[A-Za-z0-9]{32}\\.0{16}))[A-Za-z0-9]{32}\\.[A-Za-z0-9]{16}(?![A-Za-z0-9])',
+
+    # MiniMax: 常见为 sk- 开头的长 token，结合 minimax/abab 上下文识别
+    "minimax": r'sk-(?!(?:test|demo|example|sample|fake|dev|staging))[A-Za-z0-9]{32,}(?=.*(?:minimax|abab))',
+
+    # Kimi / Moonshot: 常见为 sk- 开头的长 token，结合 moonshot/kimi 上下文识别
+    "kimi": r'sk-(?!(?:test|demo|example|sample|fake|dev|staging))[A-Za-z0-9]{32,}(?=.*(?:moonshot|kimi))',
 
     # Cohere: 40字符 Base64
     "cohere": r'(?<!test)(?<!example)[a-zA-Z0-9]{40}(?=.*cohere)',
@@ -273,9 +283,9 @@ class Config:
     proxy_urls: List[str] = field(default_factory=lambda: [
         item.strip() for item in os.getenv("PROXY_POOL_URLS", "").split(",") if item.strip()
     ])
-    proxy_urls: List[str] = field(default_factory=lambda: [
-        item.strip() for item in os.getenv("PROXY_POOL_URLS", "").split(",") if item.strip()
-    ])
+    dynamic_proxy_source_url: str = field(
+        default_factory=lambda: os.getenv("DYNAMIC_PROXY_SOURCE_URL", "")
+    )
     
     # ==================== GitHub Token 池 ====================
     # 多 Token 轮询可有效规避速率限制
@@ -324,11 +334,11 @@ class Config:
     )
 
     # ==================== Provider 白名单 ====================
-    # 默认只启用用户当前关注的 OpenAI / 中转站兼容目标。
+    # 默认只启用用户当前关注的 provider。
     # 其他 provider 的正则、关键词和扫描源不会参与本轮扫描，避免额外消耗 GitHub Code Search 配额。
     enabled_providers: List[str] = field(default_factory=lambda: [
         item.strip().lower()
-        for item in os.getenv("ENABLED_PROVIDERS", "openai,relay,oneapi,newapi").split(",")
+        for item in os.getenv("ENABLED_PROVIDERS", "openai,deepseek,glm,minimax,kimi").split(",")
         if item.strip()
     ])
     
@@ -346,14 +356,21 @@ class Config:
             "sk-",
             "ANTHROPIC_API_KEY",
             "OPENAI_BASE_URL",
+            "DEEPSEEK_API_KEY",
+            "BIGMODEL_API_KEY",
+            "MINIMAX_API_KEY",
+            "MOONSHOT_API_KEY",
         ],
         "context_signals": [
             "base_url",
             "endpoint",
             "proxy",
-            "relay",
-            "one-api",
-            "new-api",
+            "deepseek",
+            "bigmodel",
+            "glm",
+            "minimax",
+            "moonshot",
+            "kimi",
         ],
         "structural_signals": [
             "filename:.env",
@@ -381,27 +398,27 @@ class Config:
             {
                 "template": "{structural} {core} {negative}",
                 "structural": ["filename:.env", "filename:.env.local", "filename:.env.production"],
-                "core": ["OPENAI_API_KEY", "OPENAI_BASE_URL"],
+                "core": ["OPENAI_API_KEY", "DEEPSEEK_API_KEY", "BIGMODEL_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY"],
                 "negative": ["NOT staging NOT sandbox NOT example", "NOT test NOT example"],
             },
             {
                 "template": "{structural} {core} {negative}",
                 "structural": ["filename:secrets.yaml", "filename:secrets.json", "filename:config.json"],
-                "core": ["openai_api_key", "sk-proj-"],
+                "core": ["openai_api_key", "deepseek_api_key", "bigmodel_api_key", "minimax_api_key", "moonshot_api_key"],
                 "negative": ["NOT example", "NOT test NOT example"],
             },
         ],
         "medium_recall": [
             {
                 "template": "{core} {structural} {negative}",
-                "core": ["sk-proj-", "sk-"],
+                "core": ["sk-proj-", "sk-", "chatglm", "moonshot", "minimax"],
                 "structural": ["language:python", "language:javascript"],
                 "negative": ["NOT test NOT example NOT mock", "NOT test NOT example NOT mock NOT staging"],
             },
             {
                 "template": "{core} {context} {negative}",
                 "core": ["sk-", "OPENAI_API_KEY="],
-                "context": ["one-api", "new-api", "relay", "api.openai-proxy"],
+                "context": ["deepseek", "bigmodel", "chatglm", "glm-4", "minimax", "abab", "moonshot", "kimi"],
                 "negative": ["NOT test NOT demo NOT example", "NOT test NOT example NOT staging"],
             },
         ],
@@ -409,7 +426,7 @@ class Config:
             {
                 "template": "{structural} {context} {negative}",
                 "structural": ["filename:config.py"],
-                "context": ["ONEAPI", "one-api", "endpoint", "proxy"],
+                "context": ["DEEPSEEK_API_KEY", "BIGMODEL_API_KEY", "MINIMAX_API_KEY", "MOONSHOT_API_KEY", "endpoint", "proxy"],
                 "negative": ["NOT test", "NOT example"],
             },
         ],
@@ -429,6 +446,9 @@ class Config:
         "huggingface": "https://api-inference.huggingface.co",
         "groq": "https://api.groq.com/openai/v1",
         "deepseek": "https://api.deepseek.com",
+        "glm": "https://open.bigmodel.cn/api/paas/v4",
+        "minimax": "https://api.minimax.chat/v1",
+        "kimi": "https://api.moonshot.cn/v1",
         "cohere": "https://api.cohere.ai/v1",
         "mistral": "https://api.mistral.ai/v1",
         "together": "https://api.together.xyz/v1",
@@ -564,41 +584,60 @@ config = Config()
 # ============================================================================
 #                          本地配置覆盖 (config_local.py)
 # ============================================================================
-# 尝试导入本地配置文件以覆盖默认设置
-# config_local.py 应该包含真实的 tokens 和敏感配置
-# 该文件已被 .gitignore 忽略，不会被提交到 Git
+def _load_local_config_namespace() -> dict:
+    config_path = os.getenv("CONFIG_PATH", os.path.join(os.path.dirname(__file__), "config_local.py"))
+    if not os.path.isfile(config_path):
+        return {}
+    spec = importlib.util.spec_from_file_location("config_local_runtime", config_path)
+    if not spec or not spec.loader:
+        return {}
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return {name: getattr(module, name) for name in dir(module) if name.isupper()}
+
+
 try:
-    from config_local import *
-    
-    # 如果 config_local.py 定义了 GITHUB_TOKENS，更新配置
-    if 'GITHUB_TOKENS' in dir():
-        config.github_tokens = GITHUB_TOKENS
-    
-    # 如果定义了 PROXY_URL，更新配置
-    if 'PROXY_URL' in dir() and PROXY_URL:
-        config.proxy_url = PROXY_URL
-    
-    # 如果定义了其他配置项，也可以在此更新
-    if 'DB_PATH' in dir():
-        config.db_path = DB_PATH
-    if 'CONSUMER_THREADS' in dir():
-        config.consumer_threads = CONSUMER_THREADS
-    if 'REQUEST_TIMEOUT' in dir():
-        config.request_timeout = REQUEST_TIMEOUT
+    local_config = _load_local_config_namespace()
 
-    # Pastebin API Key
-    if 'PASTEBIN_API_KEY' in dir():
-        config.pastebin_api_key = PASTEBIN_API_KEY
+    if 'GITHUB_TOKENS' in local_config:
+        config.github_tokens = local_config['GITHUB_TOKENS']
 
-    print("[OK] 已加载本地配置文件 config_local.py")
-except ImportError:
-    # config_local.py 不存在，使用默认配置
-    if not config.github_tokens or not any(config.github_tokens):
+    if local_config.get('PROXY_URL'):
+        config.proxy_url = local_config['PROXY_URL']
+    if local_config.get('DYNAMIC_PROXY_SOURCE_URL'):
+        config.dynamic_proxy_source_url = local_config['DYNAMIC_PROXY_SOURCE_URL']
+    if 'PROXY_POOL_URLS' in local_config:
+        config.proxy_urls = list(local_config['PROXY_POOL_URLS'] or [])
+
+    if 'DB_PATH' in local_config:
+        config.db_path = local_config['DB_PATH']
+    if 'CONSUMER_THREADS' in local_config:
+        config.consumer_threads = local_config['CONSUMER_THREADS']
+    if 'REQUEST_TIMEOUT' in local_config:
+        config.request_timeout = local_config['REQUEST_TIMEOUT']
+    if 'CONTEXT_WINDOW' in local_config:
+        config.context_window = local_config['CONTEXT_WINDOW']
+    if 'MAX_CONCURRENCY' in local_config:
+        config.max_concurrency = local_config['MAX_CONCURRENCY']
+    if 'REDIS_URL' in local_config:
+        config.redis_url = local_config['REDIS_URL']
+    if 'CIRCUIT_BREAKER_ENABLED' in local_config:
+        config.circuit_breaker_enabled = local_config['CIRCUIT_BREAKER_ENABLED']
+    if 'ENABLED_PROVIDERS' in local_config:
+        config.enabled_providers = list(local_config['ENABLED_PROVIDERS'] or [])
+    if 'SEARCH_KEYWORDS' in local_config:
+        config.search_keywords = list(local_config['SEARCH_KEYWORDS'] or [])
+    if 'PASTEBIN_API_KEY' in local_config:
+        config.pastebin_api_key = local_config['PASTEBIN_API_KEY']
+
+    if local_config:
+        print(f"[OK] 已加载本地配置文件 {os.getenv('CONFIG_PATH', 'config_local.py')}")
+    elif not config.github_tokens or not any(config.github_tokens):
         print("[WARNING] 警告: 未配置 GitHub Tokens！")
         print("   请创建 config_local.py 文件或设置环境变量 GITHUB_TOKENS")
         print("   参考: config_local.py.example")
 except Exception as e:
-    print(f"[WARNING] 加载 config_local.py 时出错: {e}")
+    print(f"[WARNING] 加载本地配置时出错: {e}")
 
 # 按 provider 白名单收敛 detector/default url，避免其他 provider 被额外源或提取逻辑误启用。
 REGEX_PATTERNS = config.filter_platform_map(REGEX_PATTERNS)
